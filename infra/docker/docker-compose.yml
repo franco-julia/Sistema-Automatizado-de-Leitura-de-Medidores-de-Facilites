@@ -1,0 +1,25 @@
+services:
+  api:
+    build:
+      context: ../../
+      dockerfile: infra/docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../../:/app
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+    command: bash -lc "cd meter_reader/services/api && pip install -r requirements.txt && uvicorn app:app --host 0.0.0.0 --port 8000"
+
+  worker:
+    build:
+      context: ../../
+      dockerfile: infra/docker/Dockerfile.worker
+    depends_on:
+      - api
+    volumes:
+      - ../../:/app
+    environment:
+      - API_URL=http://api:8000
+    command: bash -lc "cd meter_reader/services/vision_infer && pip install -r requirements.txt && python worker.py"

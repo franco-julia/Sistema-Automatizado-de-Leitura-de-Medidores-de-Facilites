@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+pillow
+sqlalchemy
+psycopg2-binary; platform_system != "Windows"
+psycopg2; platform_system == "Windows"
+python-dotenv
+numpy
+opencv-python
+pytesseract
+ultralytics
+packaging
+python-multipart
+requests
+websockets
