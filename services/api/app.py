@@ -6,6 +6,16 @@ import asyncio
 import numpy as np
 import pytesseract # type: ignore
 
+from sqlalchemy import create_engine, Column, String, DateTime, Numeric, JSON, ForeignKey, Index
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+import uuid
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
 from PIL import Image
 from io import BytesIO
 from pathlib import Path
@@ -13,99 +23,221 @@ from packaging import version
 from pydantic import BaseModel
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 
-digital_model = None
-analog_model = None
 try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
+    from dotenv import load_dotenv
+
+    load_dotenv()
 except Exception:
-    YOLO_AVAILABLE = False
+    pass
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+QUEUE_DIR = PROJECT_ROOT / "storage" / "uploads" / "queue"
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg://postgres:teste123@127.0.0.1:5432/meter_reader"
+)
+
+DIGITAL_WEIGHTS = Path(
+    os.environ.get(
+        "METER_DIGITAL_WEIGHTS",
+        PROJECT_ROOT / "models" / "digital" / "best.pt",
+    )
+)
+
+ANALOG_WEIGHTS = Path(
+    os.environ.get(
+        "METER_ANALOG_WEIGHTS",
+        PROJECT_ROOT / "models" / "analog" / "best.pt",
+    )
+)
+
+TESS_MIN = "4.0.0"
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    echo=False
+)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+class MeterDB(Base):
+    __tablename__ = "meters"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    account_id = Column(UUID(as_uuid=True), nullable=True)
+    utility = Column(String, nullable=False)
+    type = Column(String, nullable=False)
+    serial = Column(String, nullable=True, unique=True)
+    multiplier = Column(Numeric, default=1.0)
+    installed_at = Column(DateTime, nullable=True)
+
+    readings = relationship("ReadingDB", back_populates="meter")
+
+
+class ReadingDB(Base):
+    __tablename__ = "readings"
+    __table_args__ = (Index("idx_readings_meter_ts", "meter_id", "ts"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    meter_id = Column(UUID(as_uuid=True), ForeignKey("meters.id"), nullable=False)
+    ts = Column(DateTime, nullable=False)
+    value = Column(Numeric, nullable=False)
+    unit = Column(String, nullable=False)
+    confidence = Column(Numeric, nullable=True)
+    image_url = Column(String, nullable=True)
+    bbox = Column(JSONB, nullable=True)
+    model_versions = Column(JSONB, nullable=True)
+    qc_json = Column(JSONB, nullable=True)
+    status = Column(String, default="auto", nullable=False)
+
+    meter = relationship("MeterDB", back_populates="readings")
+
+def get_db():
+    db = SessionLocal()
+    try:
+        return db
+    except Exception:
+        db.close()
+        raise
+
+def normalize_meter_id(meter_id: str) -> str:
+    return meter_id.strip()
+
+def get_or_create_meter(db, meter_id: str, utility: str = "water", meter_type: str = "digital"):
+    meter_id = normalize_meter_id(meter_id)
+
+    meter = db.query(MeterDB).filter(MeterDB.serial == meter_id).first()
+    if meter:
+        return meter
+
+    meter = MeterDB(
+        id=uuid.uuid4(),
+        serial=meter_id,
+        utility=utility,
+        type=meter_type,
+    )
+    db.add(meter)
+    db.commit()
+    db.refresh(meter)
+    return meter
+
+def parse_timestamp(value: Optional[str]) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+def reading_to_dict(reading: ReadingDB) -> dict:
+    qc = reading.qc_json or {}
+    meter_code = reading.meter.serial if reading.meter and reading.meter.serial else str(reading.meter_id)
+
+    return {
+        "id": str(reading.id),
+        "job_id": qc.get("job_id"),
+        "meter_id": meter_code,
+        "timestamp": reading.ts.isoformat(),
+        "value": float(reading.value) if reading.value is not None else None,
+        "confidence": float(reading.confidence) if reading.confidence is not None else None,
+        "raw_text": qc.get("raw_text"),
+        "unit": reading.unit,
+        "model_version": (reading.model_versions or {}).get("version"),
+        "status": reading.status,
+    }
+
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Meter Reader API", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2] 
+router = APIRouter(prefix="/api", tags=["readings"])
 
-DIGITAL_WEIGHTS = Path(os.environ.get("METER_DIGITAL_WEIGHTS",
-                                      PROJECT_ROOT / "models" / "digital" / "best.pt"))
-ANALOG_WEIGHTS = Path(os.environ.get("METER_ANALOG_WEIGHTS",
-                                     PROJECT_ROOT / "models" / "analog" / "best.pt"))
+digital_model = None
+analog_model = None
 
-READINGS_FILE = Path("storage/readings.json")
+try:
+    from ultralytics import YOLO
 
-TESS_MIN = "4.0.0"
+    YOLO_AVAILABLE = True
+except Exception:
+    YOLO_AVAILABLE = False
+
+def load_models():
+    global digital_model, analog_model
+
+    if not YOLO_AVAILABLE:
+        print("[WARN] Ultralytics/YOLO não está instalado — fallback Tesseract.")
+        return
+
+    try:
+        if DIGITAL_WEIGHTS.exists():
+            digital_model = YOLO(str(DIGITAL_WEIGHTS))
+            print(f"[MODEL] Digital carregado: {DIGITAL_WEIGHTS}")
+        else:
+            print(f"[WARN] Peso digital não encontrado: {DIGITAL_WEIGHTS} — fallback Tesseract.")
+    except Exception as exc:
+        digital_model = None
+        print(f"[ERROR] Falha ao carregar modelo digital: {exc}")
+
+    try:
+        if ANALOG_WEIGHTS.exists():
+            analog_model = YOLO(str(ANALOG_WEIGHTS))
+            print(f"[MODEL] Analógico carregado: {ANALOG_WEIGHTS}")
+        else:
+            print(f"[WARN] Peso analógico não encontrado: {ANALOG_WEIGHTS}")
+    except Exception as exc:
+        analog_model = None
+        print(f"[ERROR] Falha ao carregar modelo analógico: {exc}")
+
+load_models()
+
 TESS_OK = True
 TESS_MSG = "ok"
+
 try:
     tv = pytesseract.get_tesseract_version()
     if version.parse(str(tv)) < version.parse(TESS_MIN):
         TESS_OK = False
         TESS_MSG = f"Tesseract muito antigo: {tv}. Instale 5.x 64-bit."
-except Exception as e:
+except Exception as exc:
     TESS_OK = False
-    TESS_MSG = f"Falha ao checar Tesseract: {e}"
+    TESS_MSG = f"Falha ao checar Tesseract: {exc}"
 
-def load_models():
-    global digital_model, analog_model
-    if YOLO_AVAILABLE:
-        # DIGITAL
-        try:
-            if DIGITAL_WEIGHTS.exists():
-                digital_model = YOLO(str(DIGITAL_WEIGHTS))
-                print(f"[MODEL] Digital carregado: {DIGITAL_WEIGHTS}")
-            else:
-                print(f"[WARN] Peso digital não encontrado: {DIGITAL_WEIGHTS} — fallback Tesseract.")
-        except Exception as e:
-            digital_model = None
-            print(f"[ERROR] Falha ao carregar digital: {e} — fallback Tesseract.")
-
-        # ANALOG
-        try:
-            if ANALOG_WEIGHTS.exists():
-                analog_model = YOLO(str(ANALOG_WEIGHTS))
-                print(f"[MODEL] Analog carregado: {ANALOG_WEIGHTS}")
-            else:
-                print(f"[WARN] Peso analog não encontrado: {ANALOG_WEIGHTS}")
-        except Exception as e:
-            analog_model = None
-            print(f"[ERROR] Falha ao carregar analog: {e}")
-    else:
-        print("[WARN] Ultralytics/YOLO não está instalado — usarei só Tesseract.")
-
-load_models()
-
-#Tesseract 
 def _to_value(text: str):
-    s = re.sub(r"[^0-9.]", "", text.replace(",", "."))
-    if not s:
+    cleaned = re.sub(r"[^0-9.]", "", text.replace(",", "."))
+    if not cleaned:
         return None
+
     try:
-        return float(s)
+        return float(cleaned)
     except Exception:
         return None
 
 def _score_candidate(raw_text: str, conf: float):
     digits = len(re.findall(r"\d", raw_text))
-    return (digits, conf)
+    return digits, conf
 
 def tesseract_digit_ocr(pil_img: Image.Image):
-    """OCR robusto para dígitos mecânicos/LCD (fallback)."""
     bgr = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
     h, w = bgr.shape[:2]
+
     pad = max(2, int(0.02 * min(h, w)))
-    bgr = bgr[pad:h - pad, pad:w - pad]
+    bgr = bgr[pad : h - pad, pad : w - pad]
     bgr = cv2.resize(bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -113,136 +245,222 @@ def tesseract_digit_ocr(pil_img: Image.Image):
 
     thr_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
     thr_inv = cv2.bitwise_not(thr_otsu)
-    thr_adp = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 31, 2)
+    thr_adp = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        2,
+    )
     thr_adp_i = cv2.bitwise_not(thr_adp)
 
     kernel = np.ones((2, 2), np.uint8)
-    m1 = cv2.morphologyEx(thr_otsu, cv2.MORPH_CLOSE, kernel, iterations=1)
-    m2 = cv2.morphologyEx(thr_inv, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    images = [thr_otsu, thr_inv, thr_adp, thr_adp_i, m1, m2]
-    psms = [7, 6, 8, 13]
+    images = [
+        thr_otsu,
+        thr_inv,
+        thr_adp,
+        thr_adp_i,
+        cv2.morphologyEx(thr_otsu, cv2.MORPH_CLOSE, kernel, iterations=1),
+        cv2.morphologyEx(thr_inv, cv2.MORPH_CLOSE, kernel, iterations=1),
+    ]
 
     best = {"raw_text": "", "value": None, "confidence": 0.0}
+
     for img in images:
-        for psm in psms:
-            cfg = f'-l eng --oem 1 --psm {psm} -c tessedit_char_whitelist=0123456789.,'
-            data = pytesseract.image_to_data(img, config=cfg, output_type=pytesseract.Output.DICT)
-            parts, confs = [], []
+        for psm in [7, 6, 8, 13]:
+            cfg = f"-l eng --oem 1 --psm {psm} -c tessedit_char_whitelist=0123456789.,"
+            data = pytesseract.image_to_data(
+                img,
+                config=cfg,
+                output_type=pytesseract.Output.DICT,
+            )
+
+            parts = []
+            confs = []
+
             for i, txt in enumerate(data["text"]):
+                txt = re.sub(r"[^0-9.,]", "", (txt or "").strip())
                 if not txt:
                     continue
-                txt = re.sub(r"[^0-9.,]", "", txt.strip())
-                if not txt:
-                    continue
+
                 try:
-                    c = float(data["conf"][i])
+                    conf = float(data["conf"][i])
                 except Exception:
-                    c = 0.0
+                    conf = 0.0
+
                 parts.append(txt)
-                confs.append(c)
+                confs.append(conf)
 
             raw = "".join(parts)
-            val = _to_value(raw)
-            conf = round((sum(confs) / len(confs) / 100.0), 2) if confs else 0.0
-            if _score_candidate(raw, conf) > _score_candidate(best["raw_text"], best["confidence"]):
-                best = {"raw_text": raw, "value": val, "confidence": conf}
+            value = _to_value(raw)
+            confidence = round(sum(confs) / len(confs) / 100.0, 2) if confs else 0.0
+
+            if _score_candidate(raw, confidence) > _score_candidate(
+                best["raw_text"],
+                best["confidence"],
+            ):
+                best = {
+                    "raw_text": raw,
+                    "value": value,
+                    "confidence": confidence,
+                }
 
     return best
 
-# digital
 def yolo_digit_read(pil_img: Image.Image):
-    """Lê dígitos usando o seu modelo YOLO de detecção/classificação por dígito."""
     if digital_model is None:
         return {"raw_text": "", "value": None, "confidence": 0.0}
 
     img = np.array(pil_img.convert("RGB"))
-    res = digital_model(img, verbose=False)[0]
+    result = digital_model(img, verbose=False)[0]
 
     digits = []
     confs = []
-    for box in res.boxes:
+
+    for box in result.boxes:
         x_min = float(box.xyxy[0][0])
         cls = int(box.cls[0])
         conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
+
         digits.append((x_min, str(cls)))
         confs.append(conf)
 
-    digits.sort(key=lambda t: t[0])
-    text = "".join(d[1] for d in digits)
-    value = float(text) if text else None
-    confidence = round((sum(confs) / len(confs)) if confs else 0.0, 2)
-    return {"raw_text": text, "value": value, "confidence": confidence}
+    digits.sort(key=lambda item: item[0])
+    raw_text = "".join(digit for _, digit in digits)
 
-#analog 
-def _class_name(res, idx: int) -> str:
-    """Obtém o nome de classe de forma robusta (dict ou list)."""
-    names = getattr(res, "names", None)
+    return {
+        "raw_text": raw_text,
+        "value": float(raw_text) if raw_text else None,
+        "confidence": round(sum(confs) / len(confs), 2) if confs else 0.0,
+    }
+
+def _class_name(result, idx: int) -> str:
+    names = getattr(result, "names", None)
+
     if isinstance(names, dict):
         return str(names.get(int(idx), str(int(idx))))
+
     if isinstance(names, (list, tuple)):
         i = int(idx)
         return str(names[i]) if 0 <= i < len(names) else str(i)
+
     return str(int(idx))
 
 def yolo_analog_read(pil_img: Image.Image):
-    """
-    Lê dígitos do modelo analógico (ex.: classes '0'..'9' ou nomes 'zero'..'nine').
-    Ordena por X e concatena os dígitos.
-    """
     if analog_model is None:
         return {"raw_text": "", "value": None, "confidence": 0.0}
 
-    import numpy as np
     img = np.array(pil_img.convert("RGB"))
-    res = analog_model(img, verbose=False)[0]
+    result = analog_model(img, verbose=False)[0]
 
     name_map = {
-        "zero":"0","one":"1","two":"2","three":"3","four":"4",
-        "five":"5","six":"6","seven":"7","eight":"8","nine":"9"
+        "zero": "0",
+        "one": "1",
+        "two": "2",
+        "three": "3",
+        "four": "4",
+        "five": "5",
+        "six": "6",
+        "seven": "7",
+        "eight": "8",
+        "nine": "9",
     }
 
-    digits, confs = [], []
-    for b in res.boxes:
-        x_min = float(b.xyxy[0][0])
-        cls_idx = int(b.cls[0])
-        conf = float(b.conf[0]) if hasattr(b, "conf") else 0.0
+    digits = []
+    confs = []
 
-        cls_name = _class_name(res, cls_idx).strip()
-        cls_lower = cls_name.lower()
+    for box in result.boxes:
+        x_min = float(box.xyxy[0][0])
+        cls_idx = int(box.cls[0])
+        conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
 
-        digit = name_map.get(cls_lower)
-        if digit is None and cls_lower.isdigit():
-            digit = cls_lower
+        cls_name = _class_name(result, cls_idx).strip().lower()
+        digit = name_map.get(cls_name, cls_name if cls_name.isdigit() else None)
 
         if digit is not None:
             digits.append((x_min, digit))
             confs.append(conf)
 
-    digits.sort(key=lambda t: t[0])
-    text = "".join(d for _, d in digits)
-    value = float(text) if text else None
-    confidence = round((sum(confs)/len(confs)) if confs else 0.0, 2)
-    return {"raw_text": text, "value": value, "confidence": confidence}
+    digits.sort(key=lambda item: item[0])
+    raw_text = "".join(digit for _, digit in digits)
 
-READINGS_FILE = PROJECT_ROOT / "storage" / "readings.json"
-router = APIRouter(prefix="/api", tags=["readings"])
+    return {
+        "raw_text": raw_text,
+        "value": float(raw_text) if raw_text else None,
+        "confidence": round(sum(confs) / len(confs), 2) if confs else 0.0,
+    }
+
+def infer_image(pil_img: Image.Image):
+    candidates = []
+
+    if digital_model is not None:
+        try:
+            pred = yolo_digit_read(pil_img)
+            pred["model_version"] = "yolo-digital"
+            candidates.append(pred)
+        except Exception as exc:
+            print(f"[WARN] erro yolo_digit_read: {exc}")
+
+    if analog_model is not None:
+        try:
+            pred = yolo_analog_read(pil_img)
+            pred["model_version"] = "yolo-analog"
+            candidates.append(pred)
+        except Exception as exc:
+            print(f"[WARN] erro yolo_analog_read: {exc}")
+
+    if not candidates:
+        pred = tesseract_digit_ocr(pil_img)
+        pred["model_version"] = "tesseract"
+        candidates.append(pred)
+
+    def score(candidate):
+        has_value = candidate.get("value") is not None
+        conf = float(candidate.get("confidence") or 0.0)
+        digits = len(candidate.get("raw_text") or "")
+        return has_value, digits, conf
+
+    return max(candidates, key=score)
+
+def unit_from_utility(utility: str) -> str:
+    utility = utility.lower()
+
+    if utility == "power":
+        return "kWh"
+
+    return "m3"
+
+def sanitize_folder(name: str) -> str:
+    name = name.strip()
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", name)
 
 class ReadingIn(BaseModel):
-    job_id: str | None = None
+    job_id: Optional[str] = None
     meter_id: str
-    value: float | None
-    confidence: float | None
-    raw_text: str | None
-    unit: str | None
-    model_version: str | None
-    timestamp: str | None
+    value: Optional[float] = None
+    confidence: Optional[float] = None
+    raw_text: Optional[str] = None
+    unit: Optional[str] = None
+    model_version: Optional[str] = None
+    timestamp: Optional[str] = None
 
-# Endpoints
+class UploadResponse(BaseModel):
+    job_id: str
+    path: str
+    raw_text: Optional[str] = None
+    value: Optional[float] = None
+    confidence: Optional[float] = None
+    unit: Optional[str] = None
+    model_version: Optional[str] = None
+    timestamp: Optional[str] = None
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 @app.get("/diag/models")
 def diag_models():
@@ -263,26 +481,8 @@ def diag_tesseract():
         "tesseract_cmd": pytesseract.pytesseract.tesseract_cmd,
         "ok": TESS_OK,
         "detail": TESS_MSG,
-        "version": str(pytesseract.get_tesseract_version()) if TESS_OK else None
+        "version": str(pytesseract.get_tesseract_version()) if TESS_OK else None,
     }
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2] 
-QUEUE_DIR = PROJECT_ROOT / "storage" / "uploads" / "queue"
-
-class UploadResponse(BaseModel):
-    job_id: str
-    path: str
-    raw_text: Optional[str] = None
-    value: Optional[float] = None
-    confidence: Optional[float] = None
-    unit: Optional[str] = None
-    model_version: Optional[str] = None
-    timestamp: Optional[str] = None
-
-def sanitize_folder(name: str) -> str:
-    name = name.strip()
-    name = re.sub(r"[^a-zA-Z0-9_-]+", "_", name)
-    return name
 
 @app.post("/predict")
 @app.post("/api/predict")
@@ -290,200 +490,180 @@ def sanitize_folder(name: str) -> str:
 async def predict(
     meter_id: str = Form(...),
     utility: str = Form(...),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
 ):
     if not meter_id:
         raise HTTPException(422, "meter_id is required")
 
-    meter_id_clean = sanitize_folder(meter_id)
-    util = utility.lower()
-    if util not in ("water", "gas", "power"):
+    utility = utility.lower()
+    if utility not in ("water", "gas", "power"):
         raise HTTPException(422, "utility must be WATER|GAS|POWER")
 
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    meter_id_clean = sanitize_folder(meter_id)
+    timestamp_file = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-    # diretório do job na fila 
-    job_dir = QUEUE_DIR / meter_id_clean / ts
+    job_dir = QUEUE_DIR / meter_id_clean / timestamp_file
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    img_path = job_dir / "input.jpg"
+    image_path = job_dir / "input.jpg"
 
-    # salva a imagem no disco
     content = await file.read()
     if not content:
         raise HTTPException(400, "empty file")
-    img_path.write_bytes(content)
 
-    # meta para o worker
+    image_path.write_bytes(content)
+
     (job_dir / "meta.json").write_text(
-        json.dumps({"utility": util}, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        json.dumps({"utility": utility}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
     pil_img = Image.open(BytesIO(content)).convert("RGB")
-
-    candidates = []
-
-    # YOLO digital
-    if digital_model is not None:
-        try:
-            dres = yolo_digit_read(pil_img)
-            dres["model_version"] = "yolo-digital"
-            candidates.append(dres)
-        except Exception as e:
-            print(f"[WARN] erro yolo_digit_read: {e}")
-
-    # YOLO analógico
-    if analog_model is not None:
-        try:
-            ares = yolo_analog_read(pil_img)
-            ares["model_version"] = "yolo-analog"
-            candidates.append(ares)
-        except Exception as e:
-            print(f"[WARN] erro yolo_analog_read: {e}")
-
-    raw_text = None
-    value = None
-    confidence = None
-    model_version = None
-
-    if candidates:
-        def score(c):
-            has_val = c.get("value") is not None
-            conf = float(c.get("confidence") or 0.0)
-            return (has_val, conf)
-
-        best = max(candidates, key=score)
-        raw_text = best.get("raw_text")
-        value = best.get("value")
-        confidence = best.get("confidence")
-        model_version = best.get("model_version")
-
-    unit = None
-    if util == "water":
-        unit = "m3"
-    elif util == "power":
-        unit = "kWh"
-    elif util == "gas":
-        unit = "m3"
-
-    timestamp_iso = datetime.now(timezone.utc).isoformat()
+    pred = infer_image(pil_img)
 
     return UploadResponse(
-        job_id=f"{meter_id_clean}:{ts}",
-        path=str(img_path),
-        raw_text=raw_text,
-        value=value,
-        confidence=confidence,
-        unit=unit,
-        model_version=model_version,
-        timestamp=timestamp_iso,
+        job_id=f"{meter_id_clean}:{timestamp_file}",
+        path=str(image_path),
+        raw_text=pred.get("raw_text"),
+        value=pred.get("value"),
+        confidence=pred.get("confidence"),
+        unit=unit_from_utility(utility),
+        model_version=pred.get("model_version"),
+        timestamp=datetime.now(timezone.utc).isoformat(),
     )
 
-@app.get("/api/readings")
-async def get_readings(meter_id: str = Query(None)):
-    if not READINGS_FILE.exists():
-        return {"items": []}
-
-    with open(READINGS_FILE, "r") as f:
-        data = json.load(f)
-
-    items = data if isinstance(data, list) else []
-
-    if meter_id:
-        items = [r for r in items if r.get("meter_id") == meter_id]
-
-    items = sorted(items, key=lambda x: x.get("timestamp", ""), reverse=True)
-
-    return {"items": items}
-
-@router.post("/readings")
-def create_reading(reading: ReadingIn):
-    READINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        data = json.loads(READINGS_FILE.read_text(encoding="utf-8"))
-        assert isinstance(data, list)
-    except Exception:
-        data = []
-    data.append(reading.model_dump())
-    READINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"status": "ok", "count": len(data)}
-
-@router.get("/readings")
-def list_readings(job_id: str | None = None, meter_id: str | None = None):
-    if not READINGS_FILE.exists():
-        return {"items": []}
-    try:
-        data = json.loads(READINGS_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, list):
-            data = []
-    except Exception:
-        data = []
-
-    items = data
-    if job_id:
-        items = [r for r in items if r.get("job_id") == job_id]
-    if meter_id:
-        items = [r for r in items if r.get("meter_id") == meter_id]
-
-    items = sorted(items, key=lambda x: x.get("timestamp", ""), reverse=True)
-    return {"items": items}
-
 @app.post("/api/infer")
-async def infer(meter_id: str = Form(...), utility: str = Form(...), file: UploadFile = File(...)):
+async def infer(
+    meter_id: str = Form(...),
+    utility: str = Form(...),
+    file: UploadFile = File(...),
+):
+    utility = utility.lower()
+    if utility not in ("water", "gas", "power"):
+        raise HTTPException(422, "utility must be water|gas|power")
+
     content = await file.read()
     if not content:
         raise HTTPException(400, "empty file")
 
-    pil = Image.open(BytesIO(content)).convert("RGB")
-    util = utility.lower()
-
-    if util in ("water", "gas", "power"):
-        pass
-    else:
-        raise HTTPException(422, "utility must be water|gas|power")
-
-    if util == "power":
-        pred = yolo_digit_read(pil) if digital_model is not None else tesseract_digit_ocr(pil)
-        unit = "kWh"
-    else:
-        pred = yolo_digit_read(pil) if digital_model is not None else tesseract_digit_ocr(pil)
-        unit = None
+    pil_img = Image.open(BytesIO(content)).convert("RGB")
+    pred = infer_image(pil_img)
 
     return {
         "meter_id": meter_id,
-        "utility": util,
+        "utility": utility,
         "value": pred.get("value"),
         "confidence": pred.get("confidence"),
         "raw_text": pred.get("raw_text"),
-        "unit": unit,
-        "model_version": app.version,
+        "unit": unit_from_utility(utility),
+        "model_version": pred.get("model_version"),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+@router.post("/readings")
+def create_reading(reading: ReadingIn):
+    if reading.value is None:
+        raise HTTPException(422, "value is required to save reading in PostgreSQL")
+
+    db = get_db()
+
+    try:
+        meter = get_or_create_meter(
+            db=db,
+            meter_id=reading.meter_id,
+            utility="water",
+            meter_type="digital",
+        )
+
+        new_reading = ReadingDB(
+            meter_id=meter.id,
+            ts=parse_timestamp(reading.timestamp),
+            value=reading.value,
+            unit=reading.unit or "m3",
+            confidence=reading.confidence,
+            model_versions={"version": reading.model_version} if reading.model_version else None,
+            qc_json={
+                "job_id": reading.job_id,
+                "raw_text": reading.raw_text,
+            },
+            status="auto",
+        )
+
+        db.add(new_reading)
+        db.commit()
+        db.refresh(new_reading)
+
+        return {
+            "status": "ok",
+            "id": str(new_reading.id),
+        }
+
+    finally:
+        db.close()
+
+@router.get("/readings")
+def list_readings(
+    job_id: Optional[str] = None,
+    meter_id: Optional[str] = Query(None),
+):
+    db = get_db()
+
+    try:
+        query = db.query(ReadingDB).join(MeterDB)
+
+        if meter_id:
+            query = query.filter(MeterDB.serial == normalize_meter_id(meter_id))
+
+        if job_id:
+            query = query.filter(ReadingDB.qc_json["job_id"].astext == job_id)
+
+        readings = query.order_by(ReadingDB.ts.desc()).all()
+
+        return {
+            "items": [reading_to_dict(reading) for reading in readings],
+        }
+
+    finally:
+        db.close()
 
 @app.websocket("/ws/jobs/{job_id}")
 async def ws_job(websocket: WebSocket, job_id: str):
     await websocket.accept()
+    db = get_db()
+
     try:
         for _ in range(120):
-            if READINGS_FILE.exists():
-                try:
-                    data = json.loads(READINGS_FILE.read_text(encoding="utf-8"))
-                    if isinstance(data, list):
-                        found = next((r for r in reversed(data) if r.get("job_id") == job_id), None)
-                        if found:
-                            await websocket.send_json({"status": "done", "reading": found})
-                            await websocket.close()
-                            return
-                except Exception:
-                    pass
+            reading = (
+                db.query(ReadingDB)
+                .filter(ReadingDB.qc_json["job_id"].astext == job_id)
+                .order_by(ReadingDB.ts.desc())
+                .first()
+            )
+
+            if reading:
+                await websocket.send_json(
+                    {
+                        "status": "done",
+                        "reading": reading_to_dict(reading),
+                    }
+                )
+                await websocket.close()
+                return
 
             await asyncio.sleep(1)
 
-        await websocket.send_json({"status": "timeout", "job_id": job_id})
+        await websocket.send_json(
+            {
+                "status": "timeout",
+                "job_id": job_id,
+            }
+        )
         await websocket.close()
 
     except WebSocketDisconnect:
         return
+
+    finally:
+        db.close()
 
 app.include_router(router)

@@ -1,0 +1,63 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Meter {
+  id          String    @id @default(uuid()) @db.Uuid
+  accountId   String?   @db.Uuid
+  utility     Utility
+  type        MeterType
+  serial      String?
+  multiplier  Decimal   @default(1.0)
+  installedAt DateTime?
+
+  readings    Reading[]
+
+  @@map("meters")
+}
+
+model Reading {
+  id            String   @id @default(uuid()) @db.Uuid
+  meterId       String   @db.Uuid
+  ts            DateTime
+  value         Decimal
+  unit          Unit
+  confidence    Decimal?
+  imageUrl      String?
+  bbox          Json?
+  modelVersions Json?
+  qcJson        Json?
+  status        ReadingStatus @default(auto)
+
+  meter         Meter    @relation(fields: [meterId], references: [id])
+
+  @@index([meterId, ts])
+  @@map("readings")
+}
+
+enum Utility {
+  water
+  gas
+  power
+}
+
+enum MeterType {
+  digital
+  analog
+}
+
+enum Unit {
+  kWh
+  m3
+}
+
+enum ReadingStatus {
+  auto
+  user_fixed
+  rejected
+}

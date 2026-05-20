@@ -1,0 +1,25 @@
+{
+  "name": "meter_reader",
+  "version": "1.0.0",
+  "description": "MVP para autoleitura de medidores (água, gás, eletricidade) com visão computacional.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/franco-julia/Sistema-Automatizado-de-Leitura-de-Medidores-de-Facilites.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/franco-julia/Sistema-Automatizado-de-Leitura-de-Medidores-de-Facilites/issues"
+  },
+  "homepage": "https://github.com/franco-julia/Sistema-Automatizado-de-Leitura-de-Medidores-de-Facilites#readme",
+  "dependencies": {
+    "@prisma/client": "^7.8.0",
+    "prisma": "^6.19.3"
+  }
+}
