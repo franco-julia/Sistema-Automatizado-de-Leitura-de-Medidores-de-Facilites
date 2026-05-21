@@ -14,7 +14,6 @@ class Meter(Base):
     multiplier = Column(Numeric, default=1.0)
     installed_at = Column(DateTime, nullable=True)
 
-
 class Reading(Base):
     __tablename__ = "readings"
 

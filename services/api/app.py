@@ -6,6 +6,8 @@ import uuid
 import asyncio
 import numpy as np
 import pytesseract  # type: ignore
+from jose import jwt
+from passlib.context import CryptContext
 
 from io import BytesIO
 from pathlib import Path
@@ -18,7 +20,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, WebSo
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from sqlalchemy import create_engine, Column, String, DateTime, Numeric, ForeignKey, Index
+from sqlalchemy import create_engine, Column, String, DateTime, Numeric, ForeignKey, Index, func
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -49,6 +51,14 @@ TESS_MIN = "4.0.0"
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
+
+SECRET_KEY = "UFG_METER_SECRET"
+ALGORITHM = "HS256"
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto"
+)
 
 def get_db():
     db = SessionLocal()
@@ -87,6 +97,46 @@ class ReadingDB(Base):
     status = Column(String, default="auto", nullable=False)
 
     meter = relationship("MeterDB", back_populates="readings")
+
+class UserDB(Base):
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    name = Column(String, nullable=False)
+
+    email = Column(String, unique=True, nullable=False, index=True)
+
+    password_hash = Column(String, nullable=False)
+
+    role = Column(String, nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc)
+    )
+
+class MeterCreateIn(BaseModel):
+    serial: str
+    utility: str = "water"
+    type: str = "digital"
+    multiplier: float = 1.0
+    user_id: Optional[str] = None
+
+class MeterOut(BaseModel):
+    id: str
+    serial: Optional[str]
+    utility: str
+    type: str
+    multiplier: float
+    installed_at: Optional[str] = None
+    user_id: Optional[str] = None
+
+class UserOut(BaseModel):
+    id: str
+    name: str
+    email: str
+    role: str
 
 Base.metadata.create_all(bind=engine)
 
@@ -175,6 +225,12 @@ class UploadResponse(BaseModel):
     model_version: Optional[str] = None
     timestamp: Optional[str] = None
 
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(password: str, hashed: str):
+    return pwd_context.verify(password, hashed)
+
 def sanitize_folder(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip())
 
@@ -224,6 +280,17 @@ def reading_to_dict(reading: ReadingDB) -> dict:
         "model_version": versions.get("version"),
         "image_url": reading.image_url,
         "status": reading.status,
+    }
+
+def meter_to_dict(meter: MeterDB):
+    return {
+        "id": str(meter.id),
+        "serial": meter.serial,
+        "utility": meter.utility,
+        "type": meter.type,
+        "multiplier": float(meter.multiplier or 1),
+        "installed_at": meter.installed_at.isoformat() if meter.installed_at else None,
+        "user_id": str(meter.account_id) if meter.account_id else None,
     }
 
 def _to_value(text: str):
@@ -385,6 +452,16 @@ def infer_image(pil_img: Image.Image):
 
     return max(candidates, key=score)
 
+class RegisterIn(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: str
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
@@ -411,16 +488,218 @@ def diag_tesseract():
         "version": str(pytesseract.get_tesseract_version()) if TESS_OK else None,
     }
 
+@app.post("/auth/register")
+def register(user: RegisterIn, db: Session = Depends(get_db)):
+
+    existing = db.query(UserDB).filter(
+        UserDB.email == user.email
+    ).first()
+
+    if existing:
+        raise HTTPException(400, "Email já existe")
+
+    if user.role not in ("user", "company", "admin"):
+        raise HTTPException(400, "Cargo inválido")
+
+    new_user = UserDB(
+        name=user.name,
+        email=user.email,
+        password_hash=hash_password(user.password),
+        role=user.role
+    )
+
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    return {
+        "status": "ok",
+        "user": {
+            "id": str(new_user.id),
+            "nome": new_user.name,
+            "email": new_user.email,
+            "cargo": new_user.role
+        }
+    }
+
+@app.post("/auth/login")
+def login(data: LoginIn, db: Session = Depends(get_db)):
+
+    user = db.query(UserDB).filter(
+        UserDB.email == data.email
+    ).first()
+
+    if not user:
+        raise HTTPException(401, "Credenciais inválidas")
+
+    if not verify_password(
+        data.password,
+        user.password_hash
+    ):
+        raise HTTPException(401, "Credenciais inválidas")
+
+    token = jwt.encode(
+        {
+            "sub": str(user.id),
+            "role": user.role
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM
+    )
+
+    return {
+        "access_token": token,
+        "user": {
+            "id": str(user.id),
+            "nome": user.name,
+            "email": user.email,
+            "cargo": user.role
+        }
+    }
+
+@app.post("/api/meters")
+def create_meter(data: MeterCreateIn, db: Session = Depends(get_db)):
+    utility = data.utility.lower()
+    if utility not in ("water", "gas", "power"):
+        raise HTTPException(422, "utility must be water, gas or power")
+
+    meter_type = data.type.lower()
+    if meter_type not in ("digital", "analog"):
+        raise HTTPException(422, "type must be digital or analog")
+
+    existing = db.query(MeterDB).filter(MeterDB.serial == data.serial).first()
+    if existing:
+        raise HTTPException(400, "meter already exists")
+
+    owner_id = None
+    if data.user_id:
+        try:
+            owner_id = uuid.UUID(data.user_id)
+        except Exception:
+            raise HTTPException(422, "invalid user_id")
+
+        owner = db.query(UserDB).filter(UserDB.id == owner_id).first()
+        if not owner:
+            raise HTTPException(404, "user not found")
+
+    meter = MeterDB(
+        serial=data.serial,
+        utility=utility,
+        type=meter_type,
+        multiplier=data.multiplier,
+        account_id=owner_id,
+    )
+
+    db.add(meter)
+    db.commit()
+    db.refresh(meter)
+
+    return {"status": "ok", "meter": meter_to_dict(meter)}
+
+@app.get("/api/meters")
+def list_meters(
+    user_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    query = db.query(MeterDB)
+
+    if user_id:
+        try:
+            uid = uuid.UUID(user_id)
+        except Exception:
+            raise HTTPException(422, "invalid user_id")
+        query = query.filter(MeterDB.account_id == uid)
+
+    meters = query.order_by(MeterDB.serial.asc()).all()
+    return {"items": [meter_to_dict(meter) for meter in meters]}
+
+@app.delete("/api/meters/{meter_id}")
+def delete_meter(meter_id: str, db: Session = Depends(get_db)):
+    try:
+        mid = uuid.UUID(meter_id)
+    except Exception:
+        raise HTTPException(422, "invalid meter_id")
+
+    meter = db.query(MeterDB).filter(MeterDB.id == mid).first()
+    if not meter:
+        raise HTTPException(404, "meter not found")
+
+    db.delete(meter)
+    db.commit()
+    return {"status": "deleted", "id": meter_id}
+
+@app.get("/api/users")
+def list_users(
+    role: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    query = db.query(UserDB)
+
+    if role:
+        query = query.filter(UserDB.role == role)
+
+    users = query.order_by(UserDB.name.asc()).all()
+
+    return {
+        "items": [
+            {
+                "id": str(user.id),
+                "name": user.name,
+                "email": user.email,
+                "role": user.role,
+            }
+            for user in users
+        ]
+    }
+
+@app.get("/api/dashboard/summary")
+def dashboard_summary(
+    user_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    readings_query = db.query(ReadingDB).join(MeterDB)
+    meters_query = db.query(MeterDB)
+
+    if user_id:
+        try:
+            uid = uuid.UUID(user_id)
+        except Exception:
+            raise HTTPException(422, "invalid user_id")
+
+        readings_query = readings_query.filter(MeterDB.account_id == uid)
+        meters_query = meters_query.filter(MeterDB.account_id == uid)
+
+    readings = readings_query.order_by(ReadingDB.ts.desc()).limit(5).all()
+
+    total_readings = readings_query.count()
+    total_meters = meters_query.count()
+
+    total_consumption = (
+        readings_query.with_entities(func.coalesce(func.sum(ReadingDB.value), 0)).scalar()
+    )
+
+    avg_confidence = (
+        readings_query.with_entities(func.coalesce(func.avg(ReadingDB.confidence), 0)).scalar()
+    )
+
+    return {
+        "total_meters": total_meters,
+        "total_readings": total_readings,
+        "total_consumption": float(total_consumption or 0),
+        "avg_confidence": float(avg_confidence or 0),
+        "mini_history": [reading_to_dict(reading) for reading in readings],
+    }
+
 @app.post("/predict")
 @app.post("/api/predict")
 @app.post("/api/uploads", response_model=UploadResponse)
 async def predict(meter_id: str = Form(...), utility: str = Form(...), file: UploadFile = File(...)):
     if not meter_id:
-        raise HTTPException(422, "meter_id is required")
+        raise HTTPException(422, "ID do medidor obrigatório")
 
     utility = utility.lower()
     if utility not in ("water", "gas", "power"):
-        raise HTTPException(422, "utility must be WATER|GAS|POWER")
+        raise HTTPException(422, "medidor dever ser water|gas|power")
 
     meter_id_clean = sanitize_folder(meter_id)
     timestamp_file = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -430,10 +709,10 @@ async def predict(meter_id: str = Form(...), utility: str = Form(...), file: Upl
     image_path = job_dir / "input.jpg"
     content = await file.read()
     if not content:
-        raise HTTPException(400, "empty file")
+        raise HTTPException(400, "arquivo vazio")
 
     image_path.write_bytes(content)
-    (job_dir / "meta.json").write_text(json.dumps({"utility": utility}, ensure_ascii=False, indent=2), encoding="utf-8")
+    (job_dir / "meta.json").write_text(json.dumps({"medidor": utility}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     pil_img = Image.open(BytesIO(content)).convert("RGB")
     pred = infer_image(pil_img)

@@ -1,415 +1,593 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import "./App.css";
 
-const DEFAULT_API = "http://127.0.0.1:8000";
+const API_URL = "http://127.0.0.1:8000";
 
-export default function App() {
-  const [apiBase, setApiBase] = useState(DEFAULT_API);
-  const [auth, setAuth] = useState(null); // { role: "user" | "company", name, meterId }
-  const [loginRole, setLoginRole] = useState("user");
-  const [loginName, setLoginName] = useState("");
-  const [loginMeterId, setLoginMeterId] = useState("");
+const emptyAuth = {
+  name: "",
+  email: "",
+  password: "",
+  role: "user",
+};
 
-  const [meterId, setMeterId] = useState("");
-  const [utility, setUtility] = useState("water");
-  const [file, setFile] = useState(null);
-  const [status, setStatus] = useState("Pronto.");
-  const [reading, setReading] = useState(null);
-  const [history, setHistory] = useState([]);
-  const [historyFilter, setHistoryFilter] = useState("");
+function App() {
+  const [user, setUser] = useState(() => {
+    const saved = localStorage.getItem("user");
+    return saved ? JSON.parse(saved) : null;
+  });
 
-  const fileInputRef = useRef(null);
+  const [authMode, setAuthMode] = useState("login");
+  const [authForm, setAuthForm] = useState(emptyAuth);
+  const [message, setMessage] = useState("");
 
-  const cleanApiBase = useMemo(() => apiBase.trim().replace(/\/+$/, ""), [apiBase]);
-  const wsBase = useMemo(
-    () => cleanApiBase.replace(/^http:\/\//, "ws://").replace(/^https:\/\//, "wss://"),
-    [cleanApiBase]
-  );
+  const [historico, setHistorico] = useState([]);
+  const [meters, setMeters] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [summary, setSummary] = useState(null);
 
-  function formatDate(iso) {
-    if (!iso) return "—";
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return String(iso).slice(0, 16);
-    return d.toLocaleString("pt-BR");
+  const [meterFilter, setMeterFilter] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const [uploadForm, setUploadForm] = useState({
+    meter_id: "",
+    utility: "water",
+    file: null,
+  });
+
+  const [meterForm, setMeterForm] = useState({
+    serial: "",
+    utility: "water",
+    type: "digital",
+    multiplier: "1",
+    user_id: "",
+  });
+
+  async function apiFetch(path, options = {}) {
+    const response = await fetch(`${API_URL}${path}`, {
+      ...options,
+      headers: {
+        ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+        ...(options.headers || {}),
+      },
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(data.detail || data.message || "Erro na requisição");
+    }
+
+    return data;
   }
 
-  function normalizeValue(obj) {
-    if (!obj) return null;
-    const v = obj.value ?? obj.reading ?? obj.valor;
-    return v === undefined || v === null || v === "" ? null : v;
-  }
+  async function carregarDados() {
+    if (!user) return;
 
-  async function fetchHistory(filterMeterId = "") {
     try {
-      setStatus("Carregando histórico...");
-      const query = filterMeterId ? `?meter_id=${encodeURIComponent(filterMeterId)}` : "";
-      const response = await fetch(`${cleanApiBase}/api/readings${query}`);
-      const data = await response.json().catch(() => ({}));
+      const isUser = user.role === "user";
+      const userQuery = isUser ? `?user_id=${user.id}` : "";
+      const meterQuery = meterFilter ? `?meter_id=${encodeURIComponent(meterFilter)}` : "";
 
-      if (!response.ok) {
-        throw new Error(data?.detail || "Erro ao buscar histórico");
+      const [readingsData, metersData, summaryData] = await Promise.all([
+        apiFetch(`/api/readings${meterQuery}`),
+        apiFetch(`/api/meters${userQuery}`),
+        apiFetch(`/api/dashboard/summary${userQuery}`),
+      ]);
+
+      setHistorico(readingsData.items || []);
+      setMeters(metersData.items || []);
+      setSummary(summaryData);
+
+      if (user.role === "company" || user.role === "admin") {
+        const usersData = await apiFetch("/api/users?role=user");
+        setUsers(usersData.items || []);
       }
-
-      setHistory(Array.isArray(data?.items) ? data.items : []);
-      setStatus("Histórico atualizado.");
     } catch (error) {
-      setStatus(`Erro ao carregar histórico: ${error?.message || error}`);
+      setMessage(error.message || "Erro ao carregar dados.");
     }
   }
 
   useEffect(() => {
-    if (!auth) return;
+    carregarDados();
+  }, [user]);
 
-    if (auth.role === "user") {
-      setMeterId(auth.meterId || "");
-      setHistoryFilter(auth.meterId || "");
-      fetchHistory(auth.meterId || "");
-    } else {
-      setMeterId("");
-      setHistoryFilter("");
-      fetchHistory("");
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auth]);
-
-  function handleLogin(e) {
-    e.preventDefault();
-
-    if (!loginName.trim()) {
-      setStatus("Informe o nome para entrar.");
-      return;
-    }
-
-    if (loginRole === "user" && !loginMeterId.trim()) {
-      setStatus("Informe o código do medidor do usuário local.");
-      return;
-    }
-
-    setAuth({
-      role: loginRole,
-      name: loginName.trim(),
-      meterId: loginRole === "user" ? loginMeterId.trim() : "",
-    });
-  }
-
-  function logout() {
-    setAuth(null);
-    setLoginName("");
-    setLoginMeterId("");
-    setReading(null);
-    setHistory([]);
-    setStatus("Sessão encerrada.");
-  }
-
-  function resetForm() {
-    setUtility("water");
-    setFile(null);
-    setReading(null);
-    setStatus("Formulário limpo.");
-    if (auth?.role === "company") setMeterId("");
-    if (fileInputRef.current) fileInputRef.current.value = "";
-  }
-
-  async function onSend() {
-    if (!meterId.trim() || !utility || !file) {
-      setStatus("Preencha o medidor, o tipo e selecione uma imagem.");
-      return;
-    }
-
-    setStatus("Enviando imagem...");
-
-    const formData = new FormData();
-    formData.append("meter_id", meterId.trim());
-    formData.append("utility", utility);
-    formData.append("file", file);
-
-    let jobId = "";
+  async function handleRegister(event) {
+    event.preventDefault();
+    setMessage("");
 
     try {
-      const response = await fetch(`${cleanApiBase}/api/uploads`, {
+      await apiFetch("/auth/register", {
+        method: "POST",
+        body: JSON.stringify(authForm),
+      });
+
+      setMessage("Cadastro realizado. Faça login para continuar.");
+      setAuthMode("login");
+    } catch (error) {
+      setMessage(error.message || "Erro ao cadastrar.");
+    }
+  }
+
+  async function handleLogin(event) {
+    event.preventDefault();
+    setMessage("");
+
+    try {
+      const data = await apiFetch("/auth/login", {
+        method: "POST",
+        body: JSON.stringify({
+          email: authForm.email,
+          password: authForm.password,
+        }),
+      });
+
+      setUser(data.user);
+      localStorage.setItem("user", JSON.stringify(data.user));
+      localStorage.setItem("token", data.access_token || "");
+    } catch (error) {
+      setMessage("Email ou senha inválidos.");
+    }
+  }
+
+  async function handleCreateMeter(event) {
+    event.preventDefault();
+    setMessage("");
+
+    try {
+      const ownerId = user.role === "user" ? user.id : meterForm.user_id || null;
+
+      await apiFetch("/api/meters", {
+        method: "POST",
+        body: JSON.stringify({
+          serial: meterForm.serial,
+          utility: meterForm.utility,
+          type: meterForm.type,
+          multiplier: Number(meterForm.multiplier || 1),
+          user_id: ownerId,
+        }),
+      });
+
+      setMeterForm({ serial: "", utility: "water", type: "digital", multiplier: "1", user_id: "" });
+      setMessage("Medidor cadastrado com sucesso.");
+      carregarDados();
+    } catch (error) {
+      setMessage(error.message || "Erro ao cadastrar medidor.");
+    }
+  }
+
+  async function handleUpload(event) {
+    event.preventDefault();
+
+    if (!uploadForm.meter_id || !uploadForm.file) {
+      setMessage("Informe o medidor e selecione uma imagem.");
+      return;
+    }
+
+    setLoading(true);
+    setMessage("");
+
+    try {
+      const formData = new FormData();
+      formData.append("meter_id", uploadForm.meter_id);
+      formData.append("utility", uploadForm.utility);
+      formData.append("file", uploadForm.file);
+
+      const uploadData = await apiFetch("/api/uploads", {
         method: "POST",
         body: formData,
       });
 
-      const data = await response.json().catch(() => ({}));
+      await apiFetch("/api/readings", {
+        method: "POST",
+        body: JSON.stringify({
+          job_id: uploadData.job_id,
+          meter_id: uploadForm.meter_id,
+          utility: uploadForm.utility,
+          type: "digital",
+          value: uploadData.value,
+          confidence: uploadData.confidence,
+          raw_text: uploadData.raw_text,
+          unit: uploadData.unit,
+          model_version: uploadData.model_version,
+          timestamp: uploadData.timestamp,
+          image_url: uploadData.path,
+        }),
+      });
 
-      if (!response.ok) {
-        throw new Error(data?.detail || "Erro ao enviar imagem");
-      }
-
-      jobId = data?.job_id;
-      setReading(data);
-      setStatus(`Imagem enviada. Job: ${jobId || "sem job_id"}. Aguardando worker...`);
+      setUploadForm({ meter_id: "", utility: "water", file: null });
+      setMessage("Leitura enviada e registrada com sucesso.");
+      carregarDados();
     } catch (error) {
-      setStatus(`Erro no envio: ${error?.message || error}`);
-      return;
-    }
-
-    if (!jobId) {
-      await fetchHistory(auth?.role === "user" ? auth.meterId : historyFilter);
-      return;
-    }
-
-    try {
-      const ws = new WebSocket(`${wsBase}/ws/jobs/${encodeURIComponent(jobId)}`);
-
-      ws.onmessage = async (event) => {
-        const message = JSON.parse(event.data);
-
-        if (message.status === "done") {
-          setReading(message.reading);
-          setStatus("Leitura recebida e salva no banco.");
-          ws.close();
-          await fetchHistory(auth?.role === "user" ? auth.meterId : historyFilter);
-        }
-
-        if (message.status === "timeout") {
-          setStatus("A leitura ainda não foi salva. Verifique se o worker está rodando.");
-          ws.close();
-          await fetchHistory(auth?.role === "user" ? auth.meterId : historyFilter);
-        }
-      };
-
-      ws.onerror = async () => {
-        setStatus("Não foi possível acompanhar pelo WebSocket. Atualize o histórico manualmente.");
-        await fetchHistory(auth?.role === "user" ? auth.meterId : historyFilter);
-      };
-    } catch {
-      await fetchHistory(auth?.role === "user" ? auth.meterId : historyFilter);
+      setMessage(error.message || "Erro ao enviar leitura.");
+    } finally {
+      setLoading(false);
     }
   }
 
-  if (!auth) {
+  function logout() {
+    localStorage.clear();
+    setUser(null);
+    setHistorico([]);
+    setMeters([]);
+    setUsers([]);
+    setSummary(null);
+  }
+
+  if (!user) {
     return (
-      <div className="min-h-screen bg-[#0e6ea8] p-4 md:p-8">
-        <div className="mx-auto grid min-h-[720px] max-w-[1180px] overflow-hidden rounded-[26px] bg-white shadow-[0_10px_30px_rgba(0,0,0,0.18)] md:grid-cols-[360px_1fr]">
-          <aside className="bg-[#f2c230] px-8 py-10 text-white">
-            <img src="/UFG_branco.png" alt="UFG" className="w-[250px]" />
-            <div className="mt-10 h-px bg-white/50" />
-            <h1 className="mt-10 text-[42px] font-light leading-tight">Sistema de leitura de medidores</h1>
-            <p className="mt-6 text-lg text-white/90">Acesso para concessionária ou usuário local.</p>
-          </aside>
+      <main className="auth-page">
+        <section className="auth-card">
+          <div className="brand">
+            <span className="brand-badge">UFG Meter</span>
+            <h1>Leitura inteligente de medidores</h1>
+            <p>Entre ou cadastre-se para acessar a plataforma.</p>
+          </div>
 
-          <main className="flex items-center justify-center bg-[#f2f3f5] p-8">
-            <form onSubmit={handleLogin} className="w-full max-w-[520px] rounded-2xl bg-white p-8 shadow-[0_10px_30px_rgba(0,0,0,0.10)]">
-              <h2 className="text-[42px] font-light text-gray-700">Login</h2>
-              <p className="mt-2 text-gray-500">Escolha o tipo de acesso para abrir a página correta.</p>
+          <div className="tabs">
+            <button className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")}>Entrar</button>
+            <button className={authMode === "register" ? "active" : ""} onClick={() => setAuthMode("register")}>Cadastrar</button>
+          </div>
 
-              <div className="mt-8 grid grid-cols-2 gap-3">
-                <button
-                  type="button"
-                  onClick={() => setLoginRole("user")}
-                  className={`rounded-xl px-4 py-4 font-bold ${loginRole === "user" ? "bg-[#f2c230] text-gray-900" : "bg-gray-100 text-gray-600"}`}
-                >
-                  Usuário local
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setLoginRole("company")}
-                  className={`rounded-xl px-4 py-4 font-bold ${loginRole === "company" ? "bg-[#f2c230] text-gray-900" : "bg-gray-100 text-gray-600"}`}
-                >
-                  Concessionária
-                </button>
-              </div>
+          <form className="auth-form" onSubmit={authMode === "login" ? handleLogin : handleRegister}>
+            {authMode === "register" && (
+              <>
+                <label>Nome</label>
+                <input value={authForm.name} onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })} required />
+              </>
+            )}
 
-              <label className="mt-6 block text-sm font-semibold text-gray-500">Nome</label>
-              <input
-                value={loginName}
-                onChange={(e) => setLoginName(e.target.value)}
-                placeholder="Digite seu nome"
-                className="mt-2 h-12 w-full rounded-xl border border-gray-200 px-4 outline-none focus:border-[#0e6ea8]"
-              />
+            <label>Email</label>
+            <input type="email" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} required />
 
-              {loginRole === "user" && (
-                <>
-                  <label className="mt-5 block text-sm font-semibold text-gray-500">Código do medidor</label>
-                  <input
-                    value={loginMeterId}
-                    onChange={(e) => setLoginMeterId(e.target.value)}
-                    placeholder="Ex.: testebd"
-                    className="mt-2 h-12 w-full rounded-xl border border-gray-200 px-4 outline-none focus:border-[#0e6ea8]"
-                  />
-                </>
-              )}
+            <label>Senha</label>
+            <input type="password" value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} required />
 
-              <label className="mt-5 block text-sm font-semibold text-gray-500">Endereço da API</label>
-              <input
-                value={apiBase}
-                onChange={(e) => setApiBase(e.target.value)}
-                className="mt-2 h-12 w-full rounded-xl border border-gray-200 px-4 outline-none focus:border-[#0e6ea8]"
-              />
+            {authMode === "register" && (
+              <>
+                <label>Tipo de conta</label>
+                <select value={authForm.role} onChange={(e) => setAuthForm({ ...authForm, role: e.target.value })}>
+                  <option value="user">Usuário local</option>
+                  <option value="company">Concessionária</option>
+                  <option value="admin">Administrador</option>
+                </select>
+              </>
+            )}
 
-              <button type="submit" className="mt-8 h-12 w-full rounded-xl bg-[#0e6ea8] font-bold text-white">
-                Entrar
-              </button>
+            <button className="primary-button" type="submit">
+              {authMode === "login" ? "Entrar" : "Criar conta"}
+            </button>
+          </form>
 
-              <div className="mt-5 rounded-xl bg-gray-100 p-3 text-xs text-gray-500">{status}</div>
-            </form>
-          </main>
-        </div>
-      </div>
+          {message && <p className="message">{message}</p>}
+        </section>
+      </main>
     );
   }
 
-  const value = normalizeValue(reading);
-  const unitText = reading?.unit || (utility === "power" ? "kWh" : "m3");
-  const isCompany = auth.role === "company";
-
   return (
-    <div className="min-h-screen bg-white p-4 md:p-6">
-      <div className="mx-auto flex min-h-[760px] w-[min(1400px,98vw)] overflow-hidden rounded-[26px] shadow-[0_10px_30px_rgba(0,0,0,0.12)]">
-        <aside className="w-[320px] bg-[#f2c230] px-6 py-7 text-white">
-          <div className="flex items-center justify-center border-b-2 border-white/40 pb-6">
-            <img src="/UFG_branco.png" alt="UFG" className="h-auto w-[240px] object-contain" />
+    <main className="dashboard">
+      <aside className="sidebar">
+        <h2>UFG Meter</h2>
+        <div className="user-box">
+          <strong>{user.name}</strong>
+          <span>{roleLabel(user.role)}</span>
+        </div>
+        <nav>
+          <a href="#resumo">Resumo</a>
+          <a href="#medidores">Medidores</a>
+          <a href="#historico">Histórico</a>
+          {(user.role === "company" || user.role === "admin") && <a href="#usuarios">Usuários</a>}
+        </nav>
+        <button className="logout-button" onClick={logout}>Sair</button>
+      </aside>
+
+      <section className="content">
+        <header className="topbar">
+          <div>
+            <h1>{dashboardTitle(user.role)}</h1>
+            <p>{dashboardSubtitle(user.role)}</p>
           </div>
+          <button className="secondary-button" onClick={carregarDados}>Atualizar</button>
+        </header>
 
-          <nav className="mt-10 flex flex-col gap-5 px-1">
-            <div className="rounded-xl px-3 py-4 text-[30px] font-light tracking-wide hover:bg-white/10">Painel Geral</div>
-            <div className="rounded-xl px-3 py-4 text-[30px] font-light tracking-wide hover:bg-white/10">Histórico</div>
-            <div className="rounded-xl bg-white/10 px-3 py-4 text-sm">
-              <strong>{isCompany ? "Concessionária" : "Usuário local"}</strong>
-              <br />
-              {auth.name}
-            </div>
-            <button onClick={logout} className="mt-4 rounded-xl border border-white/40 px-4 py-3 text-left font-bold text-white">
-              Sair
-            </button>
-          </nav>
-        </aside>
+        {message && <p className="message top-message">{message}</p>}
 
-        <main className="flex flex-1 gap-8 bg-[#0e6ea8] p-8">
-          <section className="flex flex-1 flex-col gap-6">
-            <div className="text-[38px] font-light tracking-wide text-white">
-              {isCompany ? "Painel da concessionária" : "Painel do usuário local"}
-            </div>
+        <SummaryCards summary={summary} meters={meters} historico={historico} />
 
-            <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
-              <div>
-                <label className="text-[30px] font-light text-white">Medidor</label>
-                <input
-                  value={meterId}
-                  onChange={(e) => setMeterId(e.target.value)}
-                  readOnly={!isCompany}
-                  className="mt-2 h-11 w-full rounded-lg bg-white px-4 text-[15px] text-gray-900 outline-none disabled:opacity-80"
-                />
-              </div>
+        <section className="grid-two">
+          <CreateMeterCard
+            user={user}
+            users={users}
+            meterForm={meterForm}
+            setMeterForm={setMeterForm}
+            handleCreateMeter={handleCreateMeter}
+          />
 
-              <div>
-                <label className="text-[30px] font-light text-white">Tipo</label>
-                <select
-                  value={utility}
-                  onChange={(e) => setUtility(e.target.value)}
-                  className="mt-2 h-11 w-full rounded-lg bg-white px-4 text-[15px] text-gray-900 outline-none"
-                >
-                  <option value="water">água</option>
-                  <option value="power">energia</option>
-                  <option value="gas">gás</option>
-                </select>
-              </div>
-            </div>
+          <UploadReadingCard
+            meters={meters}
+            uploadForm={uploadForm}
+            setUploadForm={setUploadForm}
+            handleUpload={handleUpload}
+            loading={loading}
+          />
+        </section>
 
-            <div className="mt-2 text-[40px] font-light tracking-wide text-white">Submeter a leitura</div>
+        <MetersCard meters={meters} />
 
-            <div className="relative h-[260px] rounded-xl bg-[#f2f3f5] p-5 text-gray-500">
-              <div className="flex h-full flex-col items-center justify-center gap-4">
-                <div className="flex h-[72px] w-[72px] items-center justify-center rounded-xl bg-[#f2c230] text-3xl">▧</div>
-                <div className="text-sm tracking-wide">insira a imagem</div>
-                {file ? <div className="text-xs text-gray-600">{file.name}</div> : null}
-              </div>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                onChange={(e) => {
-                  const selected = e.target.files?.[0] || null;
-                  setFile(selected);
-                  if (selected) setStatus(`Imagem selecionada: ${selected.name}`);
-                }}
-                className="absolute inset-0 cursor-pointer opacity-0"
-              />
-            </div>
+        {(user.role === "company" || user.role === "admin") && (
+          <UsersCard users={users} meters={meters} />
+        )}
 
-            <div className="flex flex-wrap items-center gap-3">
-              <button onClick={onSend} className="h-11 rounded-xl bg-[#f2c230] px-5 font-bold text-gray-900">
-                Enviar
-              </button>
-              <button onClick={resetForm} className="h-11 rounded-xl border border-white/25 bg-white/10 px-5 font-bold text-white">
-                Limpar
-              </button>
-              <button
-                onClick={() => fetchHistory(isCompany ? historyFilter : auth.meterId)}
-                className="h-11 rounded-xl border border-white/25 bg-white/10 px-5 font-bold text-white"
-              >
-                Atualizar histórico
-              </button>
-            </div>
+        <ConsumptionCard historico={historico} />
 
-            <input
-              value={apiBase}
-              onChange={(e) => setApiBase(e.target.value)}
-              className="h-11 max-w-[360px] rounded-xl bg-white px-4 text-[14px] text-gray-900 outline-none"
-            />
-          </section>
+        <MiniHistoryCard title="Mini histórico" historico={summary?.mini_history || historico.slice(0, 5)} />
 
-          <aside className="w-[500px] rounded-xl bg-[#f2f3f5] p-7 text-gray-900">
-            <div className="text-[46px] font-normal tracking-wide text-gray-600">Valor lido</div>
-            <div className="mt-4 flex items-end justify-between gap-4 pb-3">
-              <div className="text-[42px] font-medium tracking-wide text-gray-800">{value === null ? "—" : String(value)}</div>
-              <div className="flex items-center gap-2 pb-2 text-sm text-gray-500">
-                <span>{unitText}</span>
-                <span className={`inline-flex h-[18px] w-[18px] items-center justify-center rounded-[4px] bg-[#f2c230] font-black text-gray-900 ${value === null ? "opacity-30" : "opacity-100"}`}>✓</span>
-              </div>
-            </div>
-
-            <div className="text-sm text-gray-500">Confiança: {reading?.confidence ? `${Math.round(reading.confidence * 100)}%` : "—"}</div>
-            <div className="my-4 h-px bg-gray-900/15" />
-
-            <div className="flex items-center justify-between gap-3">
-              <div className="text-[40px] font-normal tracking-wide text-gray-600">Leituras anteriores</div>
-              <button onClick={() => fetchHistory(isCompany ? historyFilter : auth.meterId)} className="rounded-lg bg-[#f2c230] px-4 py-2 text-sm font-bold">
-                Atualizar
-              </button>
-            </div>
-
-            {isCompany && (
-              <input
-                value={historyFilter}
-                onChange={(e) => setHistoryFilter(e.target.value)}
-                placeholder="filtrar por medidor ou vazio para todos"
-                className="mt-4 h-10 w-full rounded-lg border border-gray-200 px-3 outline-none"
-              />
-            )}
-
-            <table className="mt-5 w-full border-collapse text-sm text-gray-700">
-              <thead>
-                <tr className="border-b border-gray-900/15 text-gray-500">
-                  <th className="py-2 text-left font-semibold">data</th>
-                  <th className="py-2 text-left font-semibold">medidor</th>
-                  <th className="py-2 text-right font-semibold">valor</th>
-                </tr>
-              </thead>
-              <tbody>
-                {history.length ? (
-                  history.slice(0, 8).map((item) => (
-                    <tr key={item.id} className="border-b border-dashed border-gray-900/10">
-                      <td className="py-3">{formatDate(item.timestamp)}</td>
-                      <td className="py-3">{item.meter_id || "—"}</td>
-                      <td className="py-3 text-right">{item.value ?? "—"} {item.unit || ""}</td>
-                    </tr>
-                  ))
-                ) : (
-                  <tr>
-                    <td className="py-3 text-gray-400">—</td>
-                    <td className="py-3 text-gray-400">—</td>
-                    <td className="py-3 text-right text-gray-400">—</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-
-            <div className="mt-8 whitespace-pre-wrap rounded-xl bg-black/5 p-3 text-xs text-gray-500">{status}</div>
-          </aside>
-        </main>
-      </div>
-    </div>
+        <HistoryCard
+          historico={historico}
+          meterFilter={meterFilter}
+          setMeterFilter={setMeterFilter}
+          carregarDados={carregarDados}
+        />
+      </section>
+    </main>
   );
 }
+
+function SummaryCards({ summary, meters, historico }) {
+  const total = summary?.total_consumption ?? historico.reduce((sum, item) => sum + Number(item.value || 0), 0);
+  const avg = summary?.avg_confidence ?? averageConfidence(historico);
+
+  return (
+    <section className="cards-grid" id="resumo">
+      <div className="mini-card"><strong>{summary?.total_meters ?? meters.length}</strong><span>Medidores cadastrados</span></div>
+      <div className="mini-card"><strong>{summary?.total_readings ?? historico.length}</strong><span>Leituras registradas</span></div>
+      <div className="mini-card"><strong>{formatNumber(total)}</strong><span>Consumo geral</span></div>
+      <div className="mini-card"><strong>{Math.round(Number(avg || 0) * 100)}%</strong><span>Confiança média</span></div>
+    </section>
+  );
+}
+
+function CreateMeterCard({ user, users, meterForm, setMeterForm, handleCreateMeter }) {
+  return (
+    <section className="card" id="medidores">
+      <h2>Cadastrar medidor</h2>
+      <form className="form-grid" onSubmit={handleCreateMeter}>
+        <label>Código/serial do medidor</label>
+        <input value={meterForm.serial} onChange={(e) => setMeterForm({ ...meterForm, serial: e.target.value })} placeholder="Ex: A001" required />
+
+        <label>Serviço</label>
+        <select value={meterForm.utility} onChange={(e) => setMeterForm({ ...meterForm, utility: e.target.value })}>
+          <option value="water">Água</option>
+          <option value="gas">Gás</option>
+          <option value="power">Energia</option>
+        </select>
+
+        <label>Tipo</label>
+        <select value={meterForm.type} onChange={(e) => setMeterForm({ ...meterForm, type: e.target.value })}>
+          <option value="digital">Digital</option>
+          <option value="analog">Analógico</option>
+        </select>
+
+        <label>Multiplicador</label>
+        <input type="number" step="0.01" value={meterForm.multiplier} onChange={(e) => setMeterForm({ ...meterForm, multiplier: e.target.value })} />
+
+        {(user.role === "company" || user.role === "admin") && (
+          <>
+            <label>Vincular a usuário</label>
+            <select value={meterForm.user_id} onChange={(e) => setMeterForm({ ...meterForm, user_id: e.target.value })}>
+              <option value="">Sem vínculo</option>
+              {users.map((item) => <option key={item.id} value={item.id}>{item.name} — {item.email}</option>)}
+            </select>
+          </>
+        )}
+
+        <button className="primary-button">Cadastrar medidor</button>
+      </form>
+    </section>
+  );
+}
+
+function UploadReadingCard({ meters, uploadForm, setUploadForm, handleUpload, loading }) {
+  return (
+    <section className="card">
+      <h2>Enviar leitura</h2>
+      <form className="form-grid" onSubmit={handleUpload}>
+        <label>Medidor</label>
+        <select 
+          value={uploadForm.meter_id} 
+          onChange={(e) => 
+            setUploadForm({ 
+              ...uploadForm, 
+              meter_id: e.target.value })} required>
+          <option value="">Selecione</option>
+          {meters.map((meter) => <option key={meter.id} value={meter.serial}>{meter.serial} — {utilityLabel(meter.utility)}</option>)}
+        </select>
+
+        <label>Serviço</label>
+        <select
+          value={uploadForm.utility}
+          onChange={(e) =>
+            setUploadForm({
+              ...uploadForm,
+              utility: e.target.value,
+            })
+          }
+        >
+          <option value="water">Água</option>
+          <option value="gas">Gás</option>
+          <option value="power">Energia</option>
+        </select>
+
+        <label>Imagem</label>
+        <input 
+          type="file" 
+          accept="image/*" 
+          onChange={(e) => setUploadForm({ ...uploadForm, file: e.target.files[0] })} required />
+
+        <button className="primary-button" disabled={loading}>{loading ? "Enviando..." : "Enviar leitura"}</button>
+      </form>
+    </section>
+  );
+}
+
+function MetersCard({ meters }) {
+  return (
+    <section className="card">
+      <h2>Medidores cadastrados</h2>
+      {meters.length === 0 ? <p>Nenhum medidor cadastrado.</p> : (
+        <div className="meter-list">
+          {meters.map((meter) => (
+            <article className="meter-item" key={meter.id}>
+              <strong>{meter.serial}</strong>
+              <span>{utilityLabel(meter.utility)} • {meter.type === "digital" ? "Digital" : "Analógico"}</span>
+              <small>Multiplicador: {meter.multiplier}</small>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function UsersCard({ users, meters }) {
+  return (
+    <section className="card" id="usuarios">
+      <h2>Usuários da concessionária</h2>
+      {users.length === 0 ? <p>Nenhum usuário local cadastrado.</p> : (
+        <div className="user-list">
+          {users.map((user) => {
+            const userMeters = meters.filter((meter) => meter.user_id === user.id);
+            return (
+              <article className="user-item" key={user.id}>
+                <div>
+                  <strong>{user.name}</strong>
+                  <span>{user.email}</span>
+                </div>
+                <em>{userMeters.length} medidor(es)</em>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ConsumptionCard({ historico }) {
+  const byMeter = useMemo(() => {
+    const map = new Map();
+    historico.forEach((item) => {
+      const key = item.meter_id || "sem medidor";
+      map.set(key, (map.get(key) || 0) + Number(item.value || 0));
+    });
+    return Array.from(map.entries()).map(([meter, total]) => ({ meter, total }));
+  }, [historico]);
+
+  return (
+    <section className="card">
+      <h2>Consumo geral por medidor</h2>
+      {byMeter.length === 0 ? <p>Sem dados de consumo.</p> : (
+        <div className="consumption-list">
+          {byMeter.map((item) => (
+            <div className="consumption-row" key={item.meter}>
+              <span>{item.meter}</span>
+              <strong>{formatNumber(item.total)}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function MiniHistoryCard({ title, historico }) {
+  return (
+    <section className="card">
+      <h2>{title}</h2>
+      {historico.length === 0 ? <p>Nenhuma leitura recente.</p> : (
+        <div className="mini-history">
+          {historico.map((item) => (
+            <article key={item.id}>
+              <strong>{item.meter_id}</strong>
+              <span>{item.value} {item.unit}</span>
+              <small>{item.timestamp ? new Date(item.timestamp).toLocaleString("pt-BR") : "-"}</small>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function HistoryCard({ historico, meterFilter, setMeterFilter, carregarDados }) {
+  return (
+    <section className="card" id="historico">
+      <div className="section-header">
+        <h2>Histórico completo</h2>
+        <div className="filter-row">
+          <input value={meterFilter} onChange={(e) => setMeterFilter(e.target.value)} placeholder="Filtrar por medidor" />
+          <button className="secondary-button" onClick={carregarDados}>Buscar</button>
+        </div>
+      </div>
+
+      {historico.length === 0 ? <p>Nenhuma leitura encontrada.</p> : (
+        <div className="table-wrapper">
+          <table>
+            <thead><tr><th>Medidor</th><th>Valor</th><th>Unidade</th><th>Confiança</th><th>Data</th><th>Status</th></tr></thead>
+            <tbody>
+              {historico.map((item) => (
+                <tr key={item.id}>
+                  <td>{item.meter_id}</td>
+                  <td>{item.value}</td>
+                  <td>{item.unit}</td>
+                  <td>{item.confidence != null ? `${Math.round(item.confidence * 100)}%` : "-"}</td>
+                  <td>{item.timestamp ? new Date(item.timestamp).toLocaleString("pt-BR") : "-"}</td>
+                  <td>{item.status}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function roleLabel(role) {
+  if (role === "user") return "Usuário local";
+  if (role === "company") return "Concessionária";
+  if (role === "admin") return "Administrador";
+  return role;
+}
+
+function dashboardTitle(role) {
+  if (role === "user") return "Painel do usuário";
+  if (role === "company") return "Dashboard da concessionária";
+  if (role === "admin") return "Painel administrativo";
+  return "Dashboard";
+}
+
+function dashboardSubtitle(role) {
+  if (role === "user") return "Cadastre seus medidores, envie leituras e acompanhe seu histórico.";
+  if (role === "company") return "Gerencie usuários, medidores, consumo geral e histórico de leituras.";
+  if (role === "admin") return "Acompanhe a operação completa da plataforma.";
+  return "";
+}
+
+function utilityLabel(utility) {
+  if (utility === "water") return "Água";
+  if (utility === "gas") return "Gás";
+  if (utility === "power") return "Energia";
+  return utility;
+}
+
+function averageConfidence(items) {
+  if (!items.length) return 0;
+  return items.reduce((sum, item) => sum + Number(item.confidence || 0), 0) / items.length;
+}
+
+function formatNumber(value) {
+  return Number(value || 0).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
+}
+
+export default App;
