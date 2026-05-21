@@ -2,80 +2,73 @@ import os
 import re
 import cv2
 import json
+import uuid
 import asyncio
 import numpy as np
-import pytesseract # type: ignore
+import pytesseract  # type: ignore
 
-from sqlalchemy import create_engine, Column, String, DateTime, Numeric, JSON, ForeignKey, Index
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-from sqlalchemy.dialects.postgresql import UUID, JSONB
-import uuid
-
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-
-from PIL import Image
 from io import BytesIO
 from pathlib import Path
+from PIL import Image
 from packaging import version
-from pydantic import BaseModel
 from datetime import datetime, timezone
-from typing import Optional, List, Dict
+from typing import Optional
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, WebSocket, WebSocketDisconnect, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from sqlalchemy import create_engine, Column, String, DateTime, Numeric, ForeignKey, Index
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except Exception:
     pass
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 QUEUE_DIR = PROJECT_ROOT / "storage" / "uploads" / "queue"
+QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql+psycopg://postgres:teste123@127.0.0.1:5432/meter_reader"
+    "postgresql+psycopg2://postgres:teste123@127.0.0.1:5432/meter_reader",
 )
 
 DIGITAL_WEIGHTS = Path(
-    os.environ.get(
-        "METER_DIGITAL_WEIGHTS",
-        PROJECT_ROOT / "models" / "digital" / "best.pt",
-    )
+    os.getenv("METER_DIGITAL_WEIGHTS", str(PROJECT_ROOT / "models" / "digital" / "best.pt"))
 )
-
 ANALOG_WEIGHTS = Path(
-    os.environ.get(
-        "METER_ANALOG_WEIGHTS",
-        PROJECT_ROOT / "models" / "analog" / "best.pt",
-    )
+    os.getenv("METER_ANALOG_WEIGHTS", str(PROJECT_ROOT / "models" / "analog" / "best.pt"))
 )
 
 TESS_MIN = "4.0.0"
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    echo=False
-)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 class MeterDB(Base):
     __tablename__ = "meters"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     account_id = Column(UUID(as_uuid=True), nullable=True)
-    utility = Column(String, nullable=False)
-    type = Column(String, nullable=False)
-    serial = Column(String, nullable=True, unique=True)
+    utility = Column(String, nullable=False, default="water")
+    type = Column(String, nullable=False, default="digital")
+    serial = Column(String, nullable=True, unique=True, index=True)
     multiplier = Column(Numeric, default=1.0)
-    installed_at = Column(DateTime, nullable=True)
+    installed_at = Column(DateTime(timezone=True), nullable=True)
 
-    readings = relationship("ReadingDB", back_populates="meter")
-
+    readings = relationship("ReadingDB", back_populates="meter", cascade="all, delete-orphan")
 
 class ReadingDB(Base):
     __tablename__ = "readings"
@@ -83,9 +76,9 @@ class ReadingDB(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     meter_id = Column(UUID(as_uuid=True), ForeignKey("meters.id"), nullable=False)
-    ts = Column(DateTime, nullable=False)
+    ts = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     value = Column(Numeric, nullable=False)
-    unit = Column(String, nullable=False)
+    unit = Column(String, nullable=False, default="m3")
     confidence = Column(Numeric, nullable=True)
     image_url = Column(String, nullable=True)
     bbox = Column(JSONB, nullable=True)
@@ -95,64 +88,9 @@ class ReadingDB(Base):
 
     meter = relationship("MeterDB", back_populates="readings")
 
-def get_db():
-    db = SessionLocal()
-    try:
-        return db
-    except Exception:
-        db.close()
-        raise
-
-def normalize_meter_id(meter_id: str) -> str:
-    return meter_id.strip()
-
-def get_or_create_meter(db, meter_id: str, utility: str = "water", meter_type: str = "digital"):
-    meter_id = normalize_meter_id(meter_id)
-
-    meter = db.query(MeterDB).filter(MeterDB.serial == meter_id).first()
-    if meter:
-        return meter
-
-    meter = MeterDB(
-        id=uuid.uuid4(),
-        serial=meter_id,
-        utility=utility,
-        type=meter_type,
-    )
-    db.add(meter)
-    db.commit()
-    db.refresh(meter)
-    return meter
-
-def parse_timestamp(value: Optional[str]) -> datetime:
-    if not value:
-        return datetime.now(timezone.utc)
-
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception:
-        return datetime.now(timezone.utc)
-
-def reading_to_dict(reading: ReadingDB) -> dict:
-    qc = reading.qc_json or {}
-    meter_code = reading.meter.serial if reading.meter and reading.meter.serial else str(reading.meter_id)
-
-    return {
-        "id": str(reading.id),
-        "job_id": qc.get("job_id"),
-        "meter_id": meter_code,
-        "timestamp": reading.ts.isoformat(),
-        "value": float(reading.value) if reading.value is not None else None,
-        "confidence": float(reading.confidence) if reading.confidence is not None else None,
-        "raw_text": qc.get("raw_text"),
-        "unit": reading.unit,
-        "model_version": (reading.model_versions or {}).get("version"),
-        "status": reading.status,
-    }
-
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Meter Reader API", version="0.3.0")
+app = FastAPI(title="Meter Reader API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -165,14 +103,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-router = APIRouter(prefix="/api", tags=["readings"])
-
 digital_model = None
 analog_model = None
 
 try:
     from ultralytics import YOLO
-
     YOLO_AVAILABLE = True
 except Exception:
     YOLO_AVAILABLE = False
@@ -189,7 +124,7 @@ def load_models():
             digital_model = YOLO(str(DIGITAL_WEIGHTS))
             print(f"[MODEL] Digital carregado: {DIGITAL_WEIGHTS}")
         else:
-            print(f"[WARN] Peso digital não encontrado: {DIGITAL_WEIGHTS} — fallback Tesseract.")
+            print(f"[WARN] Peso digital não encontrado: {DIGITAL_WEIGHTS}")
     except Exception as exc:
         digital_model = None
         print(f"[ERROR] Falha ao carregar modelo digital: {exc}")
@@ -208,7 +143,6 @@ load_models()
 
 TESS_OK = True
 TESS_MSG = "ok"
-
 try:
     tv = pytesseract.get_tesseract_version()
     if version.parse(str(tv)) < version.parse(TESS_MIN):
@@ -218,26 +152,97 @@ except Exception as exc:
     TESS_OK = False
     TESS_MSG = f"Falha ao checar Tesseract: {exc}"
 
+class ReadingIn(BaseModel):
+    job_id: Optional[str] = None
+    meter_id: str
+    utility: Optional[str] = "water"
+    type: Optional[str] = "digital"
+    value: Optional[float] = None
+    confidence: Optional[float] = None
+    raw_text: Optional[str] = None
+    unit: Optional[str] = None
+    model_version: Optional[str] = None
+    timestamp: Optional[str] = None
+    image_url: Optional[str] = None
+
+class UploadResponse(BaseModel):
+    job_id: str
+    path: str
+    raw_text: Optional[str] = None
+    value: Optional[float] = None
+    confidence: Optional[float] = None
+    unit: Optional[str] = None
+    model_version: Optional[str] = None
+    timestamp: Optional[str] = None
+
+def sanitize_folder(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip())
+
+def normalize_meter_id(meter_id: str) -> str:
+    return meter_id.strip()
+
+def parse_timestamp(value: Optional[str]) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return datetime.now(timezone.utc)
+
+def unit_from_utility(utility: str) -> str:
+    return "kWh" if utility.lower() == "power" else "m3"
+
+def get_or_create_meter(db: Session, meter_id: str, utility: str = "water", meter_type: str = "digital") -> MeterDB:
+    serial = normalize_meter_id(meter_id)
+    meter = db.query(MeterDB).filter(MeterDB.serial == serial).first()
+    if meter:
+        return meter
+
+    meter = MeterDB(serial=serial, utility=utility, type=meter_type)
+    db.add(meter)
+    db.commit()
+    db.refresh(meter)
+    return meter
+
+def reading_to_dict(reading: ReadingDB) -> dict:
+    qc = reading.qc_json or {}
+    versions = reading.model_versions or {}
+    meter_code = reading.meter.serial if reading.meter and reading.meter.serial else str(reading.meter_id)
+
+    return {
+        "id": str(reading.id),
+        "job_id": qc.get("job_id"),
+        "meter_id": meter_code,
+        "timestamp": reading.ts.isoformat() if reading.ts else None,
+        "value": float(reading.value) if reading.value is not None else None,
+        "confidence": float(reading.confidence) if reading.confidence is not None else None,
+        "raw_text": qc.get("raw_text"),
+        "unit": reading.unit,
+        "model_version": versions.get("version"),
+        "image_url": reading.image_url,
+        "status": reading.status,
+    }
+
 def _to_value(text: str):
     cleaned = re.sub(r"[^0-9.]", "", text.replace(",", "."))
     if not cleaned:
         return None
-
     try:
         return float(cleaned)
     except Exception:
         return None
 
 def _score_candidate(raw_text: str, conf: float):
-    digits = len(re.findall(r"\d", raw_text))
-    return digits, conf
+    return len(re.findall(r"\d", raw_text)), conf
 
 def tesseract_digit_ocr(pil_img: Image.Image):
     bgr = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
     h, w = bgr.shape[:2]
-
     pad = max(2, int(0.02 * min(h, w)))
-    bgr = bgr[pad : h - pad, pad : w - pad]
+    bgr = bgr[pad:h - pad, pad:w - pad]
     bgr = cv2.resize(bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -245,14 +250,7 @@ def tesseract_digit_ocr(pil_img: Image.Image):
 
     thr_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
     thr_inv = cv2.bitwise_not(thr_otsu)
-    thr_adp = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        2,
-    )
+    thr_adp = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 2)
     thr_adp_i = cv2.bitwise_not(thr_adp)
 
     kernel = np.ones((2, 2), np.uint8)
@@ -270,41 +268,26 @@ def tesseract_digit_ocr(pil_img: Image.Image):
     for img in images:
         for psm in [7, 6, 8, 13]:
             cfg = f"-l eng --oem 1 --psm {psm} -c tessedit_char_whitelist=0123456789.,"
-            data = pytesseract.image_to_data(
-                img,
-                config=cfg,
-                output_type=pytesseract.Output.DICT,
-            )
+            data = pytesseract.image_to_data(img, config=cfg, output_type=pytesseract.Output.DICT)
+            parts, confs = [], []
 
-            parts = []
-            confs = []
-
-            for i, txt in enumerate(data["text"]):
+            for i, txt in enumerate(data.get("text", [])):
                 txt = re.sub(r"[^0-9.,]", "", (txt or "").strip())
                 if not txt:
                     continue
-
                 try:
                     conf = float(data["conf"][i])
                 except Exception:
                     conf = 0.0
-
                 parts.append(txt)
                 confs.append(conf)
 
             raw = "".join(parts)
-            value = _to_value(raw)
             confidence = round(sum(confs) / len(confs) / 100.0, 2) if confs else 0.0
+            value = _to_value(raw)
 
-            if _score_candidate(raw, confidence) > _score_candidate(
-                best["raw_text"],
-                best["confidence"],
-            ):
-                best = {
-                    "raw_text": raw,
-                    "value": value,
-                    "confidence": confidence,
-                }
+            if _score_candidate(raw, confidence) > _score_candidate(best["raw_text"], best["confidence"]):
+                best = {"raw_text": raw, "value": value, "confidence": confidence}
 
     return best
 
@@ -314,21 +297,17 @@ def yolo_digit_read(pil_img: Image.Image):
 
     img = np.array(pil_img.convert("RGB"))
     result = digital_model(img, verbose=False)[0]
-
-    digits = []
-    confs = []
+    digits, confs = [], []
 
     for box in result.boxes:
         x_min = float(box.xyxy[0][0])
         cls = int(box.cls[0])
         conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
-
         digits.append((x_min, str(cls)))
         confs.append(conf)
 
     digits.sort(key=lambda item: item[0])
     raw_text = "".join(digit for _, digit in digits)
-
     return {
         "raw_text": raw_text,
         "value": float(raw_text) if raw_text else None,
@@ -337,14 +316,11 @@ def yolo_digit_read(pil_img: Image.Image):
 
 def _class_name(result, idx: int) -> str:
     names = getattr(result, "names", None)
-
     if isinstance(names, dict):
         return str(names.get(int(idx), str(int(idx))))
-
     if isinstance(names, (list, tuple)):
         i = int(idx)
         return str(names[i]) if 0 <= i < len(names) else str(i)
-
     return str(int(idx))
 
 def yolo_analog_read(pil_img: Image.Image):
@@ -353,38 +329,24 @@ def yolo_analog_read(pil_img: Image.Image):
 
     img = np.array(pil_img.convert("RGB"))
     result = analog_model(img, verbose=False)[0]
-
     name_map = {
-        "zero": "0",
-        "one": "1",
-        "two": "2",
-        "three": "3",
-        "four": "4",
-        "five": "5",
-        "six": "6",
-        "seven": "7",
-        "eight": "8",
-        "nine": "9",
+        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
     }
 
-    digits = []
-    confs = []
-
+    digits, confs = [], []
     for box in result.boxes:
         x_min = float(box.xyxy[0][0])
         cls_idx = int(box.cls[0])
         conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
-
         cls_name = _class_name(result, cls_idx).strip().lower()
         digit = name_map.get(cls_name, cls_name if cls_name.isdigit() else None)
-
         if digit is not None:
             digits.append((x_min, digit))
             confs.append(conf)
 
     digits.sort(key=lambda item: item[0])
     raw_text = "".join(digit for _, digit in digits)
-
     return {
         "raw_text": raw_text,
         "value": float(raw_text) if raw_text else None,
@@ -417,50 +379,15 @@ def infer_image(pil_img: Image.Image):
 
     def score(candidate):
         has_value = candidate.get("value") is not None
-        conf = float(candidate.get("confidence") or 0.0)
         digits = len(candidate.get("raw_text") or "")
+        conf = float(candidate.get("confidence") or 0.0)
         return has_value, digits, conf
 
     return max(candidates, key=score)
 
-def unit_from_utility(utility: str) -> str:
-    utility = utility.lower()
-
-    if utility == "power":
-        return "kWh"
-
-    return "m3"
-
-def sanitize_folder(name: str) -> str:
-    name = name.strip()
-    return re.sub(r"[^a-zA-Z0-9_-]+", "_", name)
-
-class ReadingIn(BaseModel):
-    job_id: Optional[str] = None
-    meter_id: str
-    value: Optional[float] = None
-    confidence: Optional[float] = None
-    raw_text: Optional[str] = None
-    unit: Optional[str] = None
-    model_version: Optional[str] = None
-    timestamp: Optional[str] = None
-
-class UploadResponse(BaseModel):
-    job_id: str
-    path: str
-    raw_text: Optional[str] = None
-    value: Optional[float] = None
-    confidence: Optional[float] = None
-    unit: Optional[str] = None
-    model_version: Optional[str] = None
-    timestamp: Optional[str] = None
-
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/diag/models")
 def diag_models():
@@ -487,11 +414,7 @@ def diag_tesseract():
 @app.post("/predict")
 @app.post("/api/predict")
 @app.post("/api/uploads", response_model=UploadResponse)
-async def predict(
-    meter_id: str = Form(...),
-    utility: str = Form(...),
-    file: UploadFile = File(...),
-):
+async def predict(meter_id: str = Form(...), utility: str = Form(...), file: UploadFile = File(...)):
     if not meter_id:
         raise HTTPException(422, "meter_id is required")
 
@@ -501,25 +424,20 @@ async def predict(
 
     meter_id_clean = sanitize_folder(meter_id)
     timestamp_file = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
     job_dir = QUEUE_DIR / meter_id_clean / timestamp_file
     job_dir.mkdir(parents=True, exist_ok=True)
 
     image_path = job_dir / "input.jpg"
-
     content = await file.read()
     if not content:
         raise HTTPException(400, "empty file")
 
     image_path.write_bytes(content)
-
-    (job_dir / "meta.json").write_text(
-        json.dumps({"utility": utility}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    (job_dir / "meta.json").write_text(json.dumps({"utility": utility}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     pil_img = Image.open(BytesIO(content)).convert("RGB")
     pred = infer_image(pil_img)
+    now = datetime.now(timezone.utc).isoformat()
 
     return UploadResponse(
         job_id=f"{meter_id_clean}:{timestamp_file}",
@@ -529,15 +447,11 @@ async def predict(
         confidence=pred.get("confidence"),
         unit=unit_from_utility(utility),
         model_version=pred.get("model_version"),
-        timestamp=datetime.now(timezone.utc).isoformat(),
+        timestamp=now,
     )
 
 @app.post("/api/infer")
-async def infer(
-    meter_id: str = Form(...),
-    utility: str = Form(...),
-    file: UploadFile = File(...),
-):
+async def infer(meter_id: str = Form(...), utility: str = Form(...), file: UploadFile = File(...)):
     utility = utility.lower()
     if utility not in ("water", "gas", "power"):
         raise HTTPException(422, "utility must be water|gas|power")
@@ -560,110 +474,107 @@ async def infer(
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-@router.post("/readings")
-def create_reading(reading: ReadingIn):
+@app.post("/api/readings")
+def create_reading(reading: ReadingIn, db: Session = Depends(get_db)):
     if reading.value is None:
         raise HTTPException(422, "value is required to save reading in PostgreSQL")
 
-    db = get_db()
+    utility = (reading.utility or "water").lower()
+    if utility not in ("water", "gas", "power"):
+        utility = "water"
 
-    try:
-        meter = get_or_create_meter(
-            db=db,
-            meter_id=reading.meter_id,
-            utility="water",
-            meter_type="digital",
-        )
+    meter_type = reading.type or "digital"
+    if meter_type not in ("digital", "analog"):
+        meter_type = "digital"
 
-        new_reading = ReadingDB(
-            meter_id=meter.id,
-            ts=parse_timestamp(reading.timestamp),
-            value=reading.value,
-            unit=reading.unit or "m3",
-            confidence=reading.confidence,
-            model_versions={"version": reading.model_version} if reading.model_version else None,
-            qc_json={
-                "job_id": reading.job_id,
-                "raw_text": reading.raw_text,
-            },
-            status="auto",
-        )
+    meter = get_or_create_meter(db, reading.meter_id, utility=utility, meter_type=meter_type)
 
-        db.add(new_reading)
-        db.commit()
-        db.refresh(new_reading)
+    new_reading = ReadingDB(
+        meter_id=meter.id,
+        ts=parse_timestamp(reading.timestamp),
+        value=reading.value,
+        unit=reading.unit or unit_from_utility(utility),
+        confidence=reading.confidence,
+        image_url=reading.image_url,
+        model_versions={"version": reading.model_version} if reading.model_version else None,
+        qc_json={"job_id": reading.job_id, "raw_text": reading.raw_text},
+        status="auto",
+    )
 
-        return {
-            "status": "ok",
-            "id": str(new_reading.id),
-        }
+    db.add(new_reading)
+    db.commit()
+    db.refresh(new_reading)
 
-    finally:
-        db.close()
+    return {"status": "ok", "id": str(new_reading.id), "reading": reading_to_dict(new_reading)}
 
-@router.get("/readings")
+@app.get("/api/readings")
 def list_readings(
-    job_id: Optional[str] = None,
     meter_id: Optional[str] = Query(None),
+    job_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
 ):
-    db = get_db()
+    query = db.query(ReadingDB).join(MeterDB)
 
+    if meter_id:
+        query = query.filter(MeterDB.serial == normalize_meter_id(meter_id))
+
+    if job_id:
+        query = query.filter(ReadingDB.qc_json.op("->>")("job_id") == job_id)
+
+    readings = query.order_by(ReadingDB.ts.desc()).limit(limit).all()
+    return {"items": [reading_to_dict(reading) for reading in readings]}
+
+@app.get("/api/readings/{reading_id}")
+def get_reading(reading_id: str, db: Session = Depends(get_db)):
     try:
-        query = db.query(ReadingDB).join(MeterDB)
+        rid = uuid.UUID(reading_id)
+    except Exception:
+        raise HTTPException(422, "invalid reading_id")
 
-        if meter_id:
-            query = query.filter(MeterDB.serial == normalize_meter_id(meter_id))
+    reading = db.query(ReadingDB).filter(ReadingDB.id == rid).first()
+    if not reading:
+        raise HTTPException(404, "reading not found")
 
-        if job_id:
-            query = query.filter(ReadingDB.qc_json["job_id"].astext == job_id)
+    return reading_to_dict(reading)
 
-        readings = query.order_by(ReadingDB.ts.desc()).all()
+@app.delete("/api/readings/{reading_id}")
+def delete_reading(reading_id: str, db: Session = Depends(get_db)):
+    try:
+        rid = uuid.UUID(reading_id)
+    except Exception:
+        raise HTTPException(422, "invalid reading_id")
 
-        return {
-            "items": [reading_to_dict(reading) for reading in readings],
-        }
+    reading = db.query(ReadingDB).filter(ReadingDB.id == rid).first()
+    if not reading:
+        raise HTTPException(404, "reading not found")
 
-    finally:
-        db.close()
+    db.delete(reading)
+    db.commit()
+    return {"status": "deleted", "id": reading_id}
 
 @app.websocket("/ws/jobs/{job_id}")
 async def ws_job(websocket: WebSocket, job_id: str):
     await websocket.accept()
-    db = get_db()
-
+    db = SessionLocal()
     try:
         for _ in range(120):
             reading = (
                 db.query(ReadingDB)
-                .filter(ReadingDB.qc_json["job_id"].astext == job_id)
+                .filter(ReadingDB.qc_json.op("->>")("job_id") == job_id)
                 .order_by(ReadingDB.ts.desc())
                 .first()
             )
-
             if reading:
-                await websocket.send_json(
-                    {
-                        "status": "done",
-                        "reading": reading_to_dict(reading),
-                    }
-                )
+                await websocket.send_json({"status": "done", "reading": reading_to_dict(reading)})
                 await websocket.close()
                 return
-
             await asyncio.sleep(1)
 
-        await websocket.send_json(
-            {
-                "status": "timeout",
-                "job_id": job_id,
-            }
-        )
+        await websocket.send_json({"status": "timeout", "job_id": job_id})
         await websocket.close()
 
     except WebSocketDisconnect:
         return
-
     finally:
         db.close()
-
-app.include_router(router)

@@ -1,27 +1,35 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+const DEFAULT_API = "http://127.0.0.1:8000";
 
 export default function App() {
-  const [apiBase, setApiBase] = useState("http://127.0.0.1:8000");
-  const [meterId, setMeterId] = useState("");
-  const [utility, setUtility] = useState("");
-  const [file, setFile] = useState(null);
+  const [apiBase, setApiBase] = useState(DEFAULT_API);
+  const [auth, setAuth] = useState(null); // { role: "user" | "company", name, meterId }
+  const [loginRole, setLoginRole] = useState("user");
+  const [loginName, setLoginName] = useState("");
+  const [loginMeterId, setLoginMeterId] = useState("");
 
+  const [meterId, setMeterId] = useState("");
+  const [utility, setUtility] = useState("water");
+  const [file, setFile] = useState(null);
   const [status, setStatus] = useState("Pronto.");
   const [reading, setReading] = useState(null);
   const [history, setHistory] = useState([]);
+  const [historyFilter, setHistoryFilter] = useState("");
 
   const fileInputRef = useRef(null);
 
-  const wsBase = useMemo(() => {
-    const base = apiBase.trim().replace(/\/+$/, "");
-    return base.replace(/^http:\/\//, "ws://").replace(/^https:\/\//, "wss://");
-  }, [apiBase]);
+  const cleanApiBase = useMemo(() => apiBase.trim().replace(/\/+$/, ""), [apiBase]);
+  const wsBase = useMemo(
+    () => cleanApiBase.replace(/^http:\/\//, "ws://").replace(/^https:\/\//, "wss://"),
+    [cleanApiBase]
+  );
 
   function formatDate(iso) {
     if (!iso) return "—";
     const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return String(iso).slice(0, 10);
-    return d.toLocaleDateString("pt-BR");
+    if (Number.isNaN(d.getTime())) return String(iso).slice(0, 16);
+    return d.toLocaleString("pt-BR");
   }
 
   function normalizeValue(obj) {
@@ -30,288 +38,367 @@ export default function App() {
     return v === undefined || v === null || v === "" ? null : v;
   }
 
-  async function fetchHistory(nextApiBase, nextMeterId) {
+  async function fetchHistory(filterMeterId = "") {
     try {
-      const base = nextApiBase.trim().replace(/\/+$/, "");
-      const r = await fetch(
-        `${base}/api/readings?meter_id=${encodeURIComponent(nextMeterId)}`
-      );
-      if (!r.ok) return;
-      const data = await r.json();
-      if (Array.isArray(data?.items)) setHistory(data.items);
-    } catch {
-      // ignore
+      setStatus("Carregando histórico...");
+      const query = filterMeterId ? `?meter_id=${encodeURIComponent(filterMeterId)}` : "";
+      const response = await fetch(`${cleanApiBase}/api/readings${query}`);
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data?.detail || "Erro ao buscar histórico");
+      }
+
+      setHistory(Array.isArray(data?.items) ? data.items : []);
+      setStatus("Histórico atualizado.");
+    } catch (error) {
+      setStatus(`Erro ao carregar histórico: ${error?.message || error}`);
     }
   }
 
-  function resetAll() {
-    setMeterId("");
-    setUtility("");
-    setFile(null);
+  useEffect(() => {
+    if (!auth) return;
+
+    if (auth.role === "user") {
+      setMeterId(auth.meterId || "");
+      setHistoryFilter(auth.meterId || "");
+      fetchHistory(auth.meterId || "");
+    } else {
+      setMeterId("");
+      setHistoryFilter("");
+      fetchHistory("");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auth]);
+
+  function handleLogin(e) {
+    e.preventDefault();
+
+    if (!loginName.trim()) {
+      setStatus("Informe o nome para entrar.");
+      return;
+    }
+
+    if (loginRole === "user" && !loginMeterId.trim()) {
+      setStatus("Informe o código do medidor do usuário local.");
+      return;
+    }
+
+    setAuth({
+      role: loginRole,
+      name: loginName.trim(),
+      meterId: loginRole === "user" ? loginMeterId.trim() : "",
+    });
+  }
+
+  function logout() {
+    setAuth(null);
+    setLoginName("");
+    setLoginMeterId("");
     setReading(null);
     setHistory([]);
-    setStatus("Limpo.");
+    setStatus("Sessão encerrada.");
+  }
+
+  function resetForm() {
+    setUtility("water");
+    setFile(null);
+    setReading(null);
+    setStatus("Formulário limpo.");
+    if (auth?.role === "company") setMeterId("");
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
   async function onSend() {
-    const base = apiBase.trim().replace(/\/+$/, "");
-    if (!base || !meterId || !utility || !file) {
-      setStatus("Preencha id_medidor, tipo e selecione a imagem.");
+    if (!meterId.trim() || !utility || !file) {
+      setStatus("Preencha o medidor, o tipo e selecione uma imagem.");
       return;
     }
 
-    setStatus("Enviando…");
+    setStatus("Enviando imagem...");
 
-    const fd = new FormData();
-    fd.append("meter_id", meterId);
-    fd.append("utility", utility);
-    fd.append("file", file);
+    const formData = new FormData();
+    formData.append("meter_id", meterId.trim());
+    formData.append("utility", utility);
+    formData.append("file", file);
 
-    let jobId;
+    let jobId = "";
+
     try {
-      const r = await fetch(`${base}/predict`, { method: "POST", body: fd });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(data?.detail || r.statusText);
+      const response = await fetch(`${cleanApiBase}/api/uploads`, {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data?.detail || "Erro ao enviar imagem");
+      }
+
       jobId = data?.job_id;
-      if (!jobId) throw new Error("API não retornou job_id.");
-    } catch (e) {
-      setStatus(`Erro: ${e?.message || e}`);
+      setReading(data);
+      setStatus(`Imagem enviada. Job: ${jobId || "sem job_id"}. Aguardando worker...`);
+    } catch (error) {
+      setStatus(`Erro no envio: ${error?.message || error}`);
       return;
     }
 
-    setStatus(`Job criado: ${jobId}\nAguardando resultado…`);
+    if (!jobId) {
+      await fetchHistory(auth?.role === "user" ? auth.meterId : historyFilter);
+      return;
+    }
 
     try {
-      const wsUrl = `${wsBase}/ws/jobs/${encodeURIComponent(jobId)}`;
-      const ws = new WebSocket(wsUrl);
+      const ws = new WebSocket(`${wsBase}/ws/jobs/${encodeURIComponent(jobId)}`);
 
-      ws.onmessage = async (ev) => {
-        let msg;
-        try {
-          msg = JSON.parse(ev.data);
-        } catch {
-          msg = { status: "unknown", raw: ev.data };
+      ws.onmessage = async (event) => {
+        const message = JSON.parse(event.data);
+
+        if (message.status === "done") {
+          setReading(message.reading);
+          setStatus("Leitura recebida e salva no banco.");
+          ws.close();
+          await fetchHistory(auth?.role === "user" ? auth.meterId : historyFilter);
         }
 
-        if (msg.status === "done") {
-          setReading(msg.reading);
-          setStatus("Leitura recebida ✅");
+        if (message.status === "timeout") {
+          setStatus("A leitura ainda não foi salva. Verifique se o worker está rodando.");
           ws.close();
-          await fetchHistory(base, meterId);
-        } else if (msg.status === "timeout") {
-          setStatus("Timeout aguardando leitura. Verifique se o worker está rodando.");
-          ws.close();
-        } else {
-          setStatus(JSON.stringify(msg, null, 2));
+          await fetchHistory(auth?.role === "user" ? auth.meterId : historyFilter);
         }
       };
 
-      ws.onerror = () => {
-        setStatus("Erro no WebSocket. Verifique se a API expõe /ws/jobs/{job_id}.");
+      ws.onerror = async () => {
+        setStatus("Não foi possível acompanhar pelo WebSocket. Atualize o histórico manualmente.");
+        await fetchHistory(auth?.role === "user" ? auth.meterId : historyFilter);
       };
-    } catch (e) {
-      setStatus(`Erro: ${e?.message || e}`);
+    } catch {
+      await fetchHistory(auth?.role === "user" ? auth.meterId : historyFilter);
     }
   }
 
+  if (!auth) {
+    return (
+      <div className="min-h-screen bg-[#0e6ea8] p-4 md:p-8">
+        <div className="mx-auto grid min-h-[720px] max-w-[1180px] overflow-hidden rounded-[26px] bg-white shadow-[0_10px_30px_rgba(0,0,0,0.18)] md:grid-cols-[360px_1fr]">
+          <aside className="bg-[#f2c230] px-8 py-10 text-white">
+            <img src="/UFG_branco.png" alt="UFG" className="w-[250px]" />
+            <div className="mt-10 h-px bg-white/50" />
+            <h1 className="mt-10 text-[42px] font-light leading-tight">Sistema de leitura de medidores</h1>
+            <p className="mt-6 text-lg text-white/90">Acesso para concessionária ou usuário local.</p>
+          </aside>
+
+          <main className="flex items-center justify-center bg-[#f2f3f5] p-8">
+            <form onSubmit={handleLogin} className="w-full max-w-[520px] rounded-2xl bg-white p-8 shadow-[0_10px_30px_rgba(0,0,0,0.10)]">
+              <h2 className="text-[42px] font-light text-gray-700">Login</h2>
+              <p className="mt-2 text-gray-500">Escolha o tipo de acesso para abrir a página correta.</p>
+
+              <div className="mt-8 grid grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => setLoginRole("user")}
+                  className={`rounded-xl px-4 py-4 font-bold ${loginRole === "user" ? "bg-[#f2c230] text-gray-900" : "bg-gray-100 text-gray-600"}`}
+                >
+                  Usuário local
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLoginRole("company")}
+                  className={`rounded-xl px-4 py-4 font-bold ${loginRole === "company" ? "bg-[#f2c230] text-gray-900" : "bg-gray-100 text-gray-600"}`}
+                >
+                  Concessionária
+                </button>
+              </div>
+
+              <label className="mt-6 block text-sm font-semibold text-gray-500">Nome</label>
+              <input
+                value={loginName}
+                onChange={(e) => setLoginName(e.target.value)}
+                placeholder="Digite seu nome"
+                className="mt-2 h-12 w-full rounded-xl border border-gray-200 px-4 outline-none focus:border-[#0e6ea8]"
+              />
+
+              {loginRole === "user" && (
+                <>
+                  <label className="mt-5 block text-sm font-semibold text-gray-500">Código do medidor</label>
+                  <input
+                    value={loginMeterId}
+                    onChange={(e) => setLoginMeterId(e.target.value)}
+                    placeholder="Ex.: testebd"
+                    className="mt-2 h-12 w-full rounded-xl border border-gray-200 px-4 outline-none focus:border-[#0e6ea8]"
+                  />
+                </>
+              )}
+
+              <label className="mt-5 block text-sm font-semibold text-gray-500">Endereço da API</label>
+              <input
+                value={apiBase}
+                onChange={(e) => setApiBase(e.target.value)}
+                className="mt-2 h-12 w-full rounded-xl border border-gray-200 px-4 outline-none focus:border-[#0e6ea8]"
+              />
+
+              <button type="submit" className="mt-8 h-12 w-full rounded-xl bg-[#0e6ea8] font-bold text-white">
+                Entrar
+              </button>
+
+              <div className="mt-5 rounded-xl bg-gray-100 p-3 text-xs text-gray-500">{status}</div>
+            </form>
+          </main>
+        </div>
+      </div>
+    );
+  }
+
   const value = normalizeValue(reading);
-  const unitText = reading?.unit || reading?.utility || "m";
+  const unitText = reading?.unit || (utility === "power" ? "kWh" : "m3");
+  const isCompany = auth.role === "company";
 
   return (
-    <div className="min-h-screen bg-[#ffffff] p-4 md:p-6">
-      <div className="mx-auto flex h-[min(760px,96vh)] w-[min(1400px,98vw)] overflow-hidden rounded-[26px] shadow-[0_10px_30px_rgba(0,0,0,0.12)]">
-        {/* Sidebar */}
+    <div className="min-h-screen bg-white p-4 md:p-6">
+      <div className="mx-auto flex min-h-[760px] w-[min(1400px,98vw)] overflow-hidden rounded-[26px] shadow-[0_10px_30px_rgba(0,0,0,0.12)]">
         <aside className="w-[320px] bg-[#f2c230] px-6 py-7 text-white">
           <div className="flex items-center justify-center border-b-2 border-white/40 pb-6">
-            <img
-              src="/UFG_branco.png"
-              alt="UFG"
-              className="h-auto w-[240px] object-contain"
-            />
+            <img src="/UFG_branco.png" alt="UFG" className="h-auto w-[240px] object-contain" />
           </div>
 
-          <nav className="mt-10 flex flex-col gap-6 px-1">
-            <a
-              href="#"
-              className="rounded-xl px-3 py-4 text-[34px] font-light tracking-wide hover:bg-white/10"
-            >
-              Painel Geral
-            </a>
-            <a
-              href="#"
-              className="rounded-xl px-3 py-4 text-[34px] font-light tracking-wide hover:bg-white/10"
-            >
-              Histórico
-            </a>
+          <nav className="mt-10 flex flex-col gap-5 px-1">
+            <div className="rounded-xl px-3 py-4 text-[30px] font-light tracking-wide hover:bg-white/10">Painel Geral</div>
+            <div className="rounded-xl px-3 py-4 text-[30px] font-light tracking-wide hover:bg-white/10">Histórico</div>
+            <div className="rounded-xl bg-white/10 px-3 py-4 text-sm">
+              <strong>{isCompany ? "Concessionária" : "Usuário local"}</strong>
+              <br />
+              {auth.name}
+            </div>
+            <button onClick={logout} className="mt-4 rounded-xl border border-white/40 px-4 py-3 text-left font-bold text-white">
+              Sair
+            </button>
           </nav>
         </aside>
 
-        {/* Main */}
         <main className="flex flex-1 gap-8 bg-[#0e6ea8] p-8">
-          {/* Left */}
           <section className="flex flex-1 flex-col gap-6">
-            <div className="flex flex-col gap-2">
-              <div className="text-[40px] font-light tracking-wide text-white">
-                Título
-              </div>
-              <input
-                value={meterId}
-                onChange={(e) => setMeterId(e.target.value)}
-                placeholder="id_medidor"
-                className="h-11 rounded-lg bg-white px-4 text-[15px] text-gray-900 shadow-[inset_0_0_0_1px_rgba(0,0,0,0.06)] outline-none placeholder:text-gray-400"
-              />
+            <div className="text-[38px] font-light tracking-wide text-white">
+              {isCompany ? "Painel da concessionária" : "Painel do usuário local"}
             </div>
 
-            <div className="flex flex-col gap-2">
-              <div className="text-[40px] font-light tracking-wide text-white">
-                Tipo
-              </div>
-              <select
-                value={utility}
-                onChange={(e) => setUtility(e.target.value)}
-                className="h-11 rounded-lg bg-white px-4 text-[15px] text-gray-900 shadow-[inset_0_0_0_1px_rgba(0,0,0,0.06)] outline-none"
-              >
-                <option value="" disabled>
-                  energia, água, gás
-                </option>
-                <option value="power">energia</option>
-                <option value="water">água</option>
-                <option value="gas">gás</option>
-              </select>
-            </div>
-
-            <div className="mt-2 text-[40px] font-light tracking-wide text-white">
-              Submeter a leitura
-            </div>
-
-            <div className="relative h-[380px] rounded-xl bg-[#f2f3f5] p-5 text-gray-500 shadow-[inset_0_0_0_1px_rgba(0,0,0,0.06)]">
-              <div className="flex items-center gap-4 text-[#f2c230]">
-                <span title="upload">⤴</span>
-                <span title="anexar">📎</span>
-                <span title="câmera">📷</span>
+            <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+              <div>
+                <label className="text-[30px] font-light text-white">Medidor</label>
+                <input
+                  value={meterId}
+                  onChange={(e) => setMeterId(e.target.value)}
+                  readOnly={!isCompany}
+                  className="mt-2 h-11 w-full rounded-lg bg-white px-4 text-[15px] text-gray-900 outline-none disabled:opacity-80"
+                />
               </div>
 
-              <div className="flex h-[calc(100%-40px)] flex-col items-center justify-center gap-4">
-                <div className="flex h-[72px] w-[72px] items-center justify-center rounded-xl bg-[#f2c230] shadow-[0_8px_20px_rgba(0,0,0,0.12)]">
-                  <svg
-                    width="34"
-                    height="28"
-                    viewBox="0 0 24 18"
-                    fill="none"
-                    xmlns="http://www.w3.org/2000/svg"
-                    className="opacity-90"
-                  >
-                    <path
-                      d="M3 2C1.895 2 1 2.895 1 4V14C1 15.105 1.895 16 3 16H21C22.105 16 23 15.105 23 14V4C23 2.895 22.105 2 21 2H3Z"
-                      stroke="#111827"
-                      strokeWidth="1.4"
-                    />
-                    <path
-                      d="M4 13L9 8L13 12L16 9L20 13"
-                      stroke="#111827"
-                      strokeWidth="1.4"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
-                </div>
+              <div>
+                <label className="text-[30px] font-light text-white">Tipo</label>
+                <select
+                  value={utility}
+                  onChange={(e) => setUtility(e.target.value)}
+                  className="mt-2 h-11 w-full rounded-lg bg-white px-4 text-[15px] text-gray-900 outline-none"
+                >
+                  <option value="water">água</option>
+                  <option value="power">energia</option>
+                  <option value="gas">gás</option>
+                </select>
+              </div>
+            </div>
 
+            <div className="mt-2 text-[40px] font-light tracking-wide text-white">Submeter a leitura</div>
+
+            <div className="relative h-[260px] rounded-xl bg-[#f2f3f5] p-5 text-gray-500">
+              <div className="flex h-full flex-col items-center justify-center gap-4">
+                <div className="flex h-[72px] w-[72px] items-center justify-center rounded-xl bg-[#f2c230] text-3xl">▧</div>
                 <div className="text-sm tracking-wide">insira a imagem</div>
-
-                {file ? (
-                  <div className="text-xs text-gray-600">{file.name}</div>
-                ) : null}
+                {file ? <div className="text-xs text-gray-600">{file.name}</div> : null}
               </div>
-
               <input
                 ref={fileInputRef}
                 type="file"
                 accept="image/*"
                 onChange={(e) => {
-                  const f = e.target.files?.[0] || null;
-                  setFile(f);
-                  if (f) setStatus(`Imagem selecionada: ${f.name}`);
+                  const selected = e.target.files?.[0] || null;
+                  setFile(selected);
+                  if (selected) setStatus(`Imagem selecionada: ${selected.name}`);
                 }}
                 className="absolute inset-0 cursor-pointer opacity-0"
               />
             </div>
 
-            <div className="mt-2 flex items-center gap-3">
-              <button
-                onClick={onSend}
-                className="h-11 rounded-xl bg-[#f2c230] px-5 font-bold text-gray-900 shadow-[0_10px_30px_rgba(0,0,0,0.12)]"
-              >
+            <div className="flex flex-wrap items-center gap-3">
+              <button onClick={onSend} className="h-11 rounded-xl bg-[#f2c230] px-5 font-bold text-gray-900">
                 Enviar
               </button>
-
-              <button
-                onClick={resetAll}
-                className="h-11 rounded-xl border border-white/25 bg-white/10 px-5 font-bold text-white"
-              >
+              <button onClick={resetForm} className="h-11 rounded-xl border border-white/25 bg-white/10 px-5 font-bold text-white">
                 Limpar
               </button>
-
-              <input
-                value={apiBase}
-                onChange={(e) => setApiBase(e.target.value)}
-                className="h-11 w-[360px] rounded-xl bg-white px-4 text-[14px] text-gray-900 shadow-[inset_0_0_0_1px_rgba(0,0,0,0.06)] outline-none"
-              />
+              <button
+                onClick={() => fetchHistory(isCompany ? historyFilter : auth.meterId)}
+                className="h-11 rounded-xl border border-white/25 bg-white/10 px-5 font-bold text-white"
+              >
+                Atualizar histórico
+              </button>
             </div>
+
+            <input
+              value={apiBase}
+              onChange={(e) => setApiBase(e.target.value)}
+              className="h-11 max-w-[360px] rounded-xl bg-white px-4 text-[14px] text-gray-900 outline-none"
+            />
           </section>
 
-          {/* Right */}
-          <aside className="w-[460px] rounded-xl bg-[#f2f3f5] p-7 text-gray-900 shadow-[inset_0_0_0_1px_rgba(0,0,0,0.06)]">
-            <div className="text-[46px] font-normal tracking-wide text-gray-600">
-              Valor lido
-            </div>
-
+          <aside className="w-[500px] rounded-xl bg-[#f2f3f5] p-7 text-gray-900">
+            <div className="text-[46px] font-normal tracking-wide text-gray-600">Valor lido</div>
             <div className="mt-4 flex items-end justify-between gap-4 pb-3">
-              <div className="text-[42px] font-medium tracking-wide text-gray-800">
-                {value === null ? "—" : String(value)}
-              </div>
-
+              <div className="text-[42px] font-medium tracking-wide text-gray-800">{value === null ? "—" : String(value)}</div>
               <div className="flex items-center gap-2 pb-2 text-sm text-gray-500">
                 <span>{unitText}</span>
-                <span
-                  className={`inline-flex h-[18px] w-[18px] items-center justify-center rounded-[4px] bg-[#f2c230] font-black text-gray-900 ${
-                    value === null ? "opacity-30" : "opacity-100"
-                  }`}
-                >
-                  ✓
-                </span>
+                <span className={`inline-flex h-[18px] w-[18px] items-center justify-center rounded-[4px] bg-[#f2c230] font-black text-gray-900 ${value === null ? "opacity-30" : "opacity-100"}`}>✓</span>
               </div>
             </div>
 
+            <div className="text-sm text-gray-500">Confiança: {reading?.confidence ? `${Math.round(reading.confidence * 100)}%` : "—"}</div>
             <div className="my-4 h-px bg-gray-900/15" />
 
-            <div className="text-[46px] font-normal tracking-wide text-gray-600">
-              Leitura anteriores
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-[40px] font-normal tracking-wide text-gray-600">Leituras anteriores</div>
+              <button onClick={() => fetchHistory(isCompany ? historyFilter : auth.meterId)} className="rounded-lg bg-[#f2c230] px-4 py-2 text-sm font-bold">
+                Atualizar
+              </button>
             </div>
+
+            {isCompany && (
+              <input
+                value={historyFilter}
+                onChange={(e) => setHistoryFilter(e.target.value)}
+                placeholder="filtrar por medidor ou vazio para todos"
+                className="mt-4 h-10 w-full rounded-lg border border-gray-200 px-3 outline-none"
+              />
+            )}
 
             <table className="mt-5 w-full border-collapse text-sm text-gray-700">
               <thead>
                 <tr className="border-b border-gray-900/15 text-gray-500">
                   <th className="py-2 text-left font-semibold">data</th>
+                  <th className="py-2 text-left font-semibold">medidor</th>
                   <th className="py-2 text-right font-semibold">valor</th>
                 </tr>
               </thead>
               <tbody>
                 {history.length ? (
-                  history.slice(0, 5).map((it, idx) => {
-                    const hv = it?.value ?? it?.reading ?? "—";
-                    return (
-                      <tr
-                        key={idx}
-                        className="border-b border-dashed border-gray-900/10"
-                      >
-                        <td className="py-3">{formatDate(it?.timestamp)}</td>
-                        <td className="py-3 text-right">{String(hv)}</td>
-                      </tr>
-                    );
-                  })
+                  history.slice(0, 8).map((item) => (
+                    <tr key={item.id} className="border-b border-dashed border-gray-900/10">
+                      <td className="py-3">{formatDate(item.timestamp)}</td>
+                      <td className="py-3">{item.meter_id || "—"}</td>
+                      <td className="py-3 text-right">{item.value ?? "—"} {item.unit || ""}</td>
+                    </tr>
+                  ))
                 ) : (
                   <tr>
+                    <td className="py-3 text-gray-400">—</td>
                     <td className="py-3 text-gray-400">—</td>
                     <td className="py-3 text-right text-gray-400">—</td>
                   </tr>
@@ -319,9 +406,7 @@ export default function App() {
               </tbody>
             </table>
 
-            <div className="mt-8 whitespace-pre-wrap rounded-xl bg-black/5 p-3 text-xs text-gray-500">
-              {status}
-            </div>
+            <div className="mt-8 whitespace-pre-wrap rounded-xl bg-black/5 p-3 text-xs text-gray-500">{status}</div>
           </aside>
         </main>
       </div>
