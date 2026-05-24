@@ -20,7 +20,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, WebSo
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from sqlalchemy import create_engine, Column, String, DateTime, Numeric, ForeignKey, Index, func
+from sqlalchemy import create_engine, Column, String, DateTime, Numeric, ForeignKey, Index, func, text
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -712,7 +712,7 @@ async def predict(meter_id: str = Form(...), utility: str = Form(...), file: Upl
         raise HTTPException(400, "arquivo vazio")
 
     image_path.write_bytes(content)
-    (job_dir / "meta.json").write_text(json.dumps({"medidor": utility}, ensure_ascii=False, indent=2), encoding="utf-8")
+    (job_dir / "meta.json").write_text(json.dumps({"utility": utility}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     pil_img = Image.open(BytesIO(content)).convert("RGB")
     pred = infer_image(pil_img)

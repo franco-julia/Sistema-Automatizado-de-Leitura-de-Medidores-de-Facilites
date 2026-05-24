@@ -1,4 +1,3 @@
--- Esquema mínimo (PostgreSQL compatível)
 CREATE TABLE IF NOT EXISTS meters (
   id UUID PRIMARY KEY,
   account_id UUID,
