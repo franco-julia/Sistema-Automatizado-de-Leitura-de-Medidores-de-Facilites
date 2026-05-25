@@ -613,6 +613,12 @@ def list_meters(
     meters = query.order_by(MeterDB.serial.asc()).all()
     return {"items": [meter_to_dict(meter) for meter in meters]}
 
+@app.delete("/api/readings")
+def clear_readings(db: Session = Depends(get_db)):
+    deleted = db.query(ReadingDB).delete()
+    db.commit()
+    return {"status": "cleared", "deleted": deleted}
+
 @app.delete("/api/meters/{meter_id}")
 def delete_meter(meter_id: str, db: Session = Depends(get_db)):
     try:

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import ufgLogo from "./assets/UFG_branco.png";
 import "./App.css";
 
 const API_URL = "http://127.0.0.1:8000";
@@ -216,49 +217,70 @@ function App() {
   if (!user) {
     return (
       <main className="auth-page">
-        <section className="auth-card">
-          <div className="brand">
-            <span className="brand-badge">UFG Meter</span>
-            <h1>Leitura inteligente de medidores</h1>
-            <p>Entre ou cadastre-se para acessar a plataforma.</p>
-          </div>
+        <section className="auth-left">
+          <img src={ufgLogo} alt="Logo UFG" className="ufg-logo" />
+        </section>
 
-          <div className="tabs">
-            <button className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")}>Entrar</button>
-            <button className={authMode === "register" ? "active" : ""} onClick={() => setAuthMode("register")}>Cadastrar</button>
-          </div>
+        <section className="auth-right">
+          <div className="login-box">
+            <h1>Login</h1>
 
-          <form className="auth-form" onSubmit={authMode === "login" ? handleLogin : handleRegister}>
-            {authMode === "register" && (
-              <>
-                <label>Nome</label>
-                <input value={authForm.name} onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })} required />
-              </>
-            )}
+            <form className="auth-form" onSubmit={authMode === "login" ? handleLogin : handleRegister}>
+              {authMode === "register" && (
+                <input
+                  placeholder="nome"
+                  value={authForm.name}
+                  onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })}
+                  required
+                />
+              )}
 
-            <label>Email</label>
-            <input type="email" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} required />
+              <input
+                type="email"
+                placeholder="e-mail"
+                value={authForm.email}
+                onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}
+                required
+              />
 
-            <label>Senha</label>
-            <input type="password" value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} required />
+              <input
+                type="password"
+                placeholder="senha"
+                value={authForm.password}
+                onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}
+                required
+              />
 
-            {authMode === "register" && (
-              <>
-                <label>Tipo de conta</label>
-                <select value={authForm.role} onChange={(e) => setAuthForm({ ...authForm, role: e.target.value })}>
+              {authMode === "register" && (
+                <select
+                  value={authForm.role}
+                  onChange={(e) => setAuthForm({ ...authForm, role: e.target.value })}
+                >
                   <option value="user">Usuário local</option>
                   <option value="company">Concessionária</option>
                   <option value="admin">Administrador</option>
                 </select>
-              </>
-            )}
+              )}
 
-            <button className="primary-button" type="submit">
-              {authMode === "login" ? "Entrar" : "Criar conta"}
-            </button>
-          </form>
+              <button className="forgot-button" type="button">
+                Recuperar Senha
+              </button>
 
-          {message && <p className="message">{message}</p>}
+              <button className="primary-button" type="submit">
+                {authMode === "login" ? "Entrar" : "Criar conta"}
+              </button>
+
+              <button
+                className="switch-auth"
+                type="button"
+                onClick={() => setAuthMode(authMode === "login" ? "register" : "login")}
+              >
+                {authMode === "login" ? "Criar cadastro" : "Já tenho conta"}
+              </button>
+            </form>
+
+            {message && <p className="message">{message}</p>}
+          </div>
         </section>
       </main>
     );
@@ -267,9 +289,11 @@ function App() {
   return (
     <main className="dashboard">
       <aside className="sidebar">
-        <h2>UFG Meter</h2>
-        <div className="user-box">
-          <strong>{user.name}</strong>
+        <div className="sidebar-top">
+          <img src={ufgLogo} alt="UFG" className="sidebar-logo" />
+        </div>
+        <div className="user-info-top">
+          <strong>{user.name || "Usuário"}</strong>
           <span>{roleLabel(user.role)}</span>
         </div>
         <nav>
@@ -278,57 +302,84 @@ function App() {
           <a href="#historico">Histórico</a>
           {(user.role === "company" || user.role === "admin") && <a href="#usuarios">Usuários</a>}
         </nav>
-        <button className="logout-button" onClick={logout}>Sair</button>
       </aside>
 
-      <section className="content">
-        <header className="topbar">
-          <div>
-            <h1>{dashboardTitle(user.role)}</h1>
-            <p>{dashboardSubtitle(user.role)}</p>
+    <section className="content">
+      <header className="top-header">
+        <div className="topbar-title">
+          <h1>{dashboardTitle(user.role)}</h1>
+          <p>{dashboardSubtitle(user.role)}</p>
+        </div>
+
+        <div className="user-topbar">
+          <div className="user-info-top">
+            <strong>{user.name || "Usuário"}</strong>
+            <span>
+              {user.role === "admin"
+                ? "Administrador"
+                : user.role === "company"
+                ? "Concessionária"
+                : "Usuário Local"}
+            </span>
           </div>
-          <button className="secondary-button" onClick={carregarDados}>Atualizar</button>
-        </header>
 
-        {message && <p className="message top-message">{message}</p>}
+          <button className="logout-top" onClick={logout}>
+            Sair
+          </button>
+        </div>
+      </header>
 
-        <SummaryCards summary={summary} meters={meters} historico={historico} />
+      <div className="top-actions">
+        <button className="secondary-button" onClick={carregarDados}>
+          Atualizar
+        </button>
+        <button onClick={limparHistorico}>
+          Limpar histórico
+        </button>
+      </div>
 
-        <section className="grid-two">
-          <CreateMeterCard
-            user={user}
-            users={users}
-            meterForm={meterForm}
-            setMeterForm={setMeterForm}
-            handleCreateMeter={handleCreateMeter}
-          />
+      {message && <p className="message top-message">{message}</p>}
 
-          <UploadReadingCard
-            meters={meters}
-            uploadForm={uploadForm}
-            setUploadForm={setUploadForm}
-            handleUpload={handleUpload}
-            loading={loading}
-          />
-        </section>
+      <SummaryCards summary={summary} meters={meters} historico={historico} />
 
-        <MetersCard meters={meters} />
+      <section className="grid-two">
+        <CreateMeterCard
+          user={user}
+          users={users}
+          meterForm={meterForm}
+          setMeterForm={setMeterForm}
+          handleCreateMeter={handleCreateMeter}
+        />
 
-        {(user.role === "company" || user.role === "admin") && (
-          <UsersCard users={users} meters={meters} />
-        )}
-
-        <ConsumptionCard historico={historico} />
-
-        <MiniHistoryCard title="Mini histórico" historico={summary?.mini_history || historico.slice(0, 5)} />
-
-        <HistoryCard
-          historico={historico}
-          meterFilter={meterFilter}
-          setMeterFilter={setMeterFilter}
-          carregarDados={carregarDados}
+        <UploadReadingCard
+          meters={meters}
+          uploadForm={uploadForm}
+          setUploadForm={setUploadForm}
+          handleUpload={handleUpload}
+          loading={loading}
         />
       </section>
+
+      <MetersCard meters={meters} />
+
+      {(user.role === "company" || user.role === "admin") && (
+        <UsersCard users={users} meters={meters} />
+      )}
+
+      <ConsumptionCard historico={historico} />
+
+      <MiniHistoryCard
+        title="Mini histórico"
+        historico={summary?.mini_history || historico.slice(0, 5)}
+      />
+
+      <HistoryCard
+        historico={historico}
+        meterFilter={meterFilter}
+        setMeterFilter={setMeterFilter}
+        carregarDados={carregarDados}
+      />
+    </section>
     </main>
   );
 }
@@ -588,6 +639,14 @@ function averageConfidence(items) {
 
 function formatNumber(value) {
   return Number(value || 0).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
+}
+
+async function limparHistorico() {
+  await fetch("http://127.0.0.1:8000/api/readings", {
+    method: "DELETE",
+  });
+
+  await carregarDados();
 }
 
 export default App;
