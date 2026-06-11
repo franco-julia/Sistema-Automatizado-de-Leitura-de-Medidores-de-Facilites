@@ -5,7 +5,10 @@ import json
 import uuid
 import asyncio
 import numpy as np
-import pytesseract  # type: ignore
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
 from jose import jwt
 from passlib.context import CryptContext
 
@@ -364,21 +367,57 @@ def yolo_digit_read(pil_img: Image.Image):
 
     img = np.array(pil_img.convert("RGB"))
     result = digital_model(img, verbose=False)[0]
-    digits, confs = [], []
+
+    detections = []
+    confs = []
 
     for box in result.boxes:
         x_min = float(box.xyxy[0][0])
-        cls = int(box.cls[0])
+        cls_idx = int(box.cls[0])
         conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
-        digits.append((x_min, str(cls)))
+
+        class_name = _class_name(result, cls_idx).strip().lower()
+
+        # Ignora a classe 17, usada para detectar LCD/display
+        if cls_idx == 17 or class_name in ("lcd", "display", "visor"):
+            continue
+
+        # Dígitos 0 a 9
+        if class_name.isdigit() and len(class_name) == 1:
+            char = class_name
+        elif 0 <= cls_idx <= 9:
+            char = str(cls_idx)
+
+        # Vírgula ou ponto detectados pelo modelo
+        elif class_name in (",", "comma", "virgula", "vírgula"):
+            char = ","
+        elif class_name in (".", "dot", "point", "ponto"):
+            char = "."
+        else:
+            continue
+
+        detections.append((x_min, char))
         confs.append(conf)
 
-    digits.sort(key=lambda item: item[0])
-    raw_text = "".join(digit for _, digit in digits)
+    detections.sort(key=lambda item: item[0])
+
+    raw_text = "".join(char for _, char in detections)
+
+    value = None
+    if raw_text:
+        try:
+            normalized = raw_text.replace(",", ".")
+            value = float(normalized)
+        except ValueError:
+            only_numbers = re.sub(r"[^0-9]", "", raw_text)
+            value = float(only_numbers) if only_numbers else None
+
+    confidence = round(sum(confs) / len(confs), 2) if confs else 0.0
+
     return {
         "raw_text": raw_text,
-        "value": float(raw_text) if raw_text else None,
-        "confidence": round(sum(confs) / len(confs), 2) if confs else 0.0,
+        "value": value,
+        "confidence": confidence,
     }
 
 def _class_name(result, idx: int) -> str:
@@ -439,18 +478,22 @@ def infer_image(pil_img: Image.Image):
         except Exception as exc:
             print(f"[WARN] erro yolo_analog_read: {exc}")
 
-    if not candidates:
+    valid_candidates = [
+        c for c in candidates
+        if c.get("value") is not None
+    ]
+
+    if not valid_candidates:
         pred = tesseract_digit_ocr(pil_img)
         pred["model_version"] = "tesseract"
-        candidates.append(pred)
+        valid_candidates.append(pred)
 
     def score(candidate):
-        has_value = candidate.get("value") is not None
-        digits = len(candidate.get("raw_text") or "")
+        raw = candidate.get("raw_text") or ""
         conf = float(candidate.get("confidence") or 0.0)
-        return has_value, digits, conf
+        return len(raw), conf
 
-    return max(candidates, key=score)
+    return max(valid_candidates, key=score)
 
 class RegisterIn(BaseModel):
     name: str
@@ -618,6 +661,18 @@ def clear_readings(db: Session = Depends(get_db)):
     deleted = db.query(ReadingDB).delete()
     db.commit()
     return {"status": "cleared", "deleted": deleted}
+
+@app.delete("/api/reset")
+def reset_system(db: Session = Depends(get_db)):
+
+    db.execute(text("TRUNCATE TABLE readings RESTART IDENTITY CASCADE"))
+    db.execute(text("TRUNCATE TABLE meters RESTART IDENTITY CASCADE"))
+
+    db.commit()
+
+    return {
+        "status": "ok"
+    }
 
 @app.delete("/api/meters/{meter_id}")
 def delete_meter(meter_id: str, db: Session = Depends(get_db)):

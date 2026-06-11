@@ -86,12 +86,13 @@ label {
 input,
 select {
   width: 100%;
+  height: 30px;
   border: 1px solid #d6deeb;
   border-radius: 12px;
   padding: 13px 14px;
   background: #ffffff;
   outline: none;
-  color: #ffffff;
+  color: #000000;
 }
 
 input:focus,
@@ -106,14 +107,14 @@ select:focus {
   padding: 13px 18px;
   background: #f6c700;
   color: #ffffff;
-  font-weight: 800;
+  font-weight: 700;
   cursor: pointer;
   transition: 0.2s;
   align-self: flex-start;
   margin-top: 4px;
   width: 92px;
   height: 57px;
-  font-size: 15px;
+  font-size: 12px;
 }
 
 .primary-button:hover {
@@ -278,7 +279,6 @@ select:focus {
   font-size: 16px;
 }
 
-
 .user-info-top {
   display: flex;
   flex-direction: column;
@@ -286,10 +286,18 @@ select:focus {
   gap: 4px;
 }
 
+.sidebar-divider {
+  width: 100%;
+  height: 2px;
+  background: rgba(255, 255, 255, 0.9);
+  border-radius: 999px;
+  margin: 8px 0 18px;
+}
 
 .top-actions {
   display: flex;
-  justify-content: flex-start;
+  align-items: center;
+  gap: 14px;
   margin-bottom: 36px;
 }
 
@@ -301,6 +309,11 @@ select:focus {
   padding: 16px 22px;
   border-radius: 14px;
   cursor: pointer;
+  transition: 0.2s;
+}
+
+.clear-button {
+  border-color: rgba(255, 255, 255, 0.25);
 }
 
 @media (max-width: 820px) {
@@ -339,6 +352,7 @@ select:focus {
 
 .card {
   background: white;
+  color: #979797;
   border-radius: 22px;
   padding: 24px;
   box-shadow: 0 12px 34px rgba(20, 40, 80, 0.08);
@@ -520,7 +534,6 @@ td {
   background: rgba(255,255,255,.12); 
 }
 
-.secondary-button,
 .logout-button { 
   margin-top: auto; 
   border: 1px solid rgba(255,255,255,.25); 
